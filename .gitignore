@@ -1,0 +1,24 @@
+# set up by install.ps1 (all inside the program folder)
+/.tools/
+/.python/
+/.venv/
+/.runtime/
+/.cache/
+# local working copy of the catalog folder + this machine's settings
+/.work/
+/settings.toml
+__pycache__/
+*.pyc
+
+# outputs of the old version (before 2.0) that may still lie in a development copy
+/cache/
+/logs/
+/catalog*.csv
+/catalog.html
+/catalog.json
+/catalog.sqlite
+/CATALOG.md
+/CHANGELOG.md
+/manual_overrides.csv
+/needs_input.csv
+/comments.csv

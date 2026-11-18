@@ -1,0 +1,67 @@
+# Default configuration of the microscopy dataset catalog. Do not edit: settings of a machine go
+# into settings.toml (written by the setup page, http://localhost:8766/setup), which overrides
+# these defaults key by key. Paths may use single quotes (TOML literal strings).
+
+# --- set on the setup page ---------------------------------------------------------------------
+# Root of the (read-only!) data directory. Nothing below it is ever written - except inside
+# catalog_dir.
+labdata_root = ''
+# Catalog folder: database (incl. comments), manual values, previews, raw-metadata cache and the
+# published page (index.html). Inside labdata_root it must be a folder directly in it (the scan
+# skips it). The server works on a local copy (work_dir) and copies every change here within
+# seconds; only one server at a time may write (server.lock in this folder).
+catalog_dir = ''
+# Incremental update every N minutes (0 = only after edits / on demand).
+auto_update_min = 60
+# Preview images: "network" (read at most ~300 MB per image - fine over VPN), "full" (up to
+# ~3 GB per image, for huge stacks on a fast connection) or "off".
+previews = "network"
+# Minutes per run spent on new preview images (the rest follows in the next run).
+preview_budget_min = 20
+
+# --- advanced ----------------------------------------------------------------------------------
+# Java (JDK bin folder) + folder with the Bio-Formats jar: set by install.ps1 in
+# .runtime/runtime.json. Only set here to override.
+java_bin = ''
+bioformats_lib = ''
+java_xmx = "4g"
+
+# Local working copy of the catalog folder (relative to the program folder).
+work_dir = '.work'
+
+# Catalog server: http://localhost:<port>, reachable on this machine only.
+server_port = 8766
+
+# Files/folders modified less than this many minutes ago are treated as "still being written"
+# and are only read in a later run.
+recent_minutes = 60
+
+# A single file read that produces no progress for this long is aborted (marked as error).
+hang_timeout_s = 1800
+
+# Top-level folders of labdata_root that are not microscopy data.
+exclude_top = ["HERA_Crashmonitor", "Overviews_Comparisons"]
+
+# SceneViewerTool (optional), used by scenes.py --live and for files that are not in the catalog.
+sceneviewer = ''
+
+# Folder/file names that are skipped anywhere in the tree (case-insensitive).
+# Names starting with "." (e.g. .bfmemo, .imaris_cache, .vscode) are always skipped.
+exclude_names = ["_temp", "__pycache__", "Thumbs.db", "desktop.ini"]
+
+# Path components marking data acquired by somebody else -> owner = "other".
+other_owner_names = ["otherPeopleData"]
+
+# Raw image formats read with Bio-Formats (one catalog entry per file).
+raw_exts = [".vsi", ".lif", ".xlef", ".czi", ".ims", ".nd2", ".oib", ".oir", ".lsm", ".tif", ".tiff"]
+
+# Low-metadata snapshot formats (catalogued with date/size/dimensions only).
+snapshot_exts = [".jpg", ".jpeg", ".avi"]
+
+# Folder names whose content is processed/derived data, metadata, or converted data.
+processed_dirs = ["processedData", "tiff_exports", "exports", "analysis"]
+metadata_dirs = ["metaData", "metadata"]
+converted_dirs = ["convertedData"]
+
+# File names (lower case substring) that mark a segmentation result (csv/zip/tif...).
+segmentation_patterns = ["cellpose", "cpsam", "segment", "_seg", "mask", "labels", "nuclei", "roi"]
