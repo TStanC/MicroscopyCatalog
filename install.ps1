@@ -16,6 +16,7 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -JavaHome "C:\path\to\jdk"   use this JDK
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -DownloadJdk    ignore installed JDKs, download one
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -WithMicroio <path or git URL>   optional zarr reader
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Port 8780    use another port than 8766
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Stop           stop the server
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall      stop + remove the autostart shortcut
 
@@ -26,7 +27,8 @@ param(
     [switch]$Uninstall,
     [string]$JavaHome = "",
     [switch]$DownloadJdk,
-    [string]$WithMicroio = ""
+    [string]$WithMicroio = "",
+    [int]$Port = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -231,6 +233,46 @@ if ($LASTEXITCODE -ne 0) { throw "Compiling java\OmeDump.java failed - Java/Bio-
 if ($LASTEXITCODE -ne 0) { throw "Python environment check failed" }
 Say "  Java + Bio-Formats + Python ok"
 
+# --- port ----------------------------------------------------------------------------------------
+Step "Port"
+$settingsFile = Join-Path $root "settings.toml"
+function Get-SettingsPort {
+    foreach ($f in @($settingsFile, (Join-Path $root "config.toml"))) {
+        if (Test-Path $f) {
+            $m = Select-String -Path $f -Pattern '^\s*server_port\s*=\s*(\d+)' | Select-Object -First 1
+            if ($m) { return [int]$m.Matches[0].Groups[1].Value }
+        }
+    }
+    return 8766
+}
+function Set-SettingsPort($p) {
+    $lines = @()
+    if (Test-Path $settingsFile) { $lines = @(Get-Content $settingsFile | Where-Object { $_ -notmatch '^\s*server_port\s*=' }) }
+    $lines += "server_port = $p"
+    [IO.File]::WriteAllText($settingsFile, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+}
+function Get-PortOwner($p) {
+    # our own server was stopped above, so anything listening here is another program
+    $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $c) { return $null }
+    $pr = Get-CimInstance Win32_Process -Filter "ProcessId=$($c.OwningProcess)" -ErrorAction SilentlyContinue
+    if ($pr) { return "$($pr.Name) (PID $($pr.ProcessId))" } else { return "process $($c.OwningProcess)" }
+}
+if ($Port) { Set-SettingsPort $Port }
+$usePort = Get-SettingsPort
+$owner = Get-PortOwner $usePort
+if ($owner) {
+    Say "  port $usePort is already used by another program: $owner"
+    if ($Port) { throw "Port $Port is in use - choose another one with -Port <number>" }
+    for ($pp = $usePort + 1; $pp -le $usePort + 50; $pp++) {
+        if (-not (Get-PortOwner $pp)) { $usePort = $pp; break }
+    }
+    Set-SettingsPort $usePort
+    Say "  using port $usePort instead (saved in settings.toml)"
+}
+$url = "http://localhost:$usePort"
+Say "  $url"
+
 # --- autostart + start ---------------------------------------------------------------------------
 if ($Autostart) {
     $sh = New-Object -ComObject WScript.Shell
@@ -238,7 +280,7 @@ if ($Autostart) {
     $sc.TargetPath = $venvPyw
     $sc.Arguments = "`"$serve`""
     $sc.WorkingDirectory = $root
-    $sc.Description = "Microscopy catalog server (http://localhost:8766)"
+    $sc.Description = "Microscopy catalog server ($url)"
     $sc.Save()
     Say "Autostart shortcut: $lnk"
 }
@@ -249,9 +291,9 @@ if (-not $NoStart) {
     $ok = $false
     for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
         Start-Sleep -Seconds 1
-        try { $s = Invoke-RestMethod -UseBasicParsing "http://localhost:8766/api/state" -TimeoutSec 2; $ok = $true } catch { }
+        try { $s = Invoke-RestMethod -UseBasicParsing "http://127.0.0.1:$usePort/api/state" -TimeoutSec 5; if ($s.status) { $ok = $true } } catch { }  # localhost may try IPv6 first (slow)
     }
-    if ($ok) { Say "Server running: http://localhost:8766  (status: $($s.status))" }
+    if ($ok) { Say "Server running: $url  (status: $($s.status))" }
     else { Say "The server did not answer yet - see $root\.work\logs\server.log" }
 }
 Say ""

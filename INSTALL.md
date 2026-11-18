@@ -53,7 +53,7 @@ Use `-DownloadJdk` to always use the script's own JDK instead.
 
 ## 3. Set up
 
-At the end the installer opens `http://localhost:8766/setup`:
+At the end the installer opens `http://localhost:8766/setup` (or another port if 8766 is taken, see Troubleshooting):
 
 1. **Labdata folder**: e.g. `X:\Titus\Labdata`. **Browse…** opens a folder dialog, which may
    appear behind the browser window.
@@ -116,6 +116,7 @@ catalog folder, and refreshes it every 2 minutes.
 | The page says "read-only: maintained by the server of …" | Another server owns the catalog folder (see *Several machines*). |
 | The setup page shows Java or Bio-Formats as missing | Run `install.ps1` again. |
 | The download fails (proxy, firewall) | Run `install.ps1` again (finished downloads are reused). If it keeps failing, download the JDK yourself and pass `-JavaHome`. |
+| Another program already uses port 8766 | The installer then picks the next free port (it tells you which one, e.g. `http://localhost:8767`) and saves it in `settings.toml`. To choose one yourself: `install.ps1 -Port 8780`. |
 | The server does not start | See `.work\logs\server.log` and `.work\logs\server_crash.log`. |
 | You moved or renamed the program folder | Run `install.ps1` again (the Python environment contains absolute paths). |
 | Optional: better zarr inspection with microio | `install.ps1 -WithMicroio <path or git URL of microio>` |

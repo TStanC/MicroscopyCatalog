@@ -26,6 +26,7 @@ import getpass
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -49,6 +50,18 @@ DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROU
 STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup",
                            "Microscopy Catalog Server.lnk")
 EXIT_MSG = {2: "not set up", 4: "Labdata folder not reachable", 5: "catalog folder is maintained by another server"}
+
+
+class Server(ThreadingHTTPServer):
+    """Binds the port exclusively. The stdlib default (SO_REUSEADDR) lets a second program bind
+    the same port on Windows - then two servers run and the browser reaches either of them."""
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def pythonw() -> str:
@@ -185,10 +198,10 @@ class App:
         self.holder: dict | None = None
         self.owns_lock = False
         self.last_beat = 0.0
-        self.httpd: ThreadingHTTPServer | None = None
+        self.httpd: Server | None = None
         self._wake = threading.Event()
         if cfg.configured:
-            self.status = "offline"
+            self.status, self.status_msg = "starting", "starting - checking the Labdata and catalog folders"
             self.builder = Builder(self, config_arg)
             self.previewer = Previewer(self, config_arg)
             threading.Thread(target=self._supervise_loop, daemon=True, name="supervisor").start()
@@ -560,6 +573,25 @@ def make_handler(app: App, port: int):
     return Handler
 
 
+def catalog_answers(port: int) -> bool:
+    """Is the program listening on ``port`` this catalog server?"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=3) as r:
+            return r.headers.get("Server", "").startswith("mdcat") and "status" in json.load(r)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def show_error(msg: str) -> None:
+    """Message box (the server runs without a console under pythonw)."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, msg, "Microscopy catalog", 0x10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None, help="settings file (default: settings.toml in the program folder)")
@@ -578,13 +610,20 @@ def main(argv=None) -> int:
     httpd = None
     for attempt in range(30 if args.wait_port else 1):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app, port))
+            httpd = Server(("127.0.0.1", port), make_handler(app, port))
             break
         except OSError as exc:
             if attempt == (29 if args.wait_port else 0):
-                app.log(f"Cannot listen on port {port} ({exc}) - is the server already running?")
-                if args.open:  # "Start Catalog" while it already runs: just show the page
-                    webbrowser.open(f"http://localhost:{port}")
+                if catalog_answers(port):  # "Start Catalog" while it already runs: just show the page
+                    app.log(f"port {port}: the catalog server is already running")
+                    if args.open:
+                        webbrowser.open(f"http://localhost:{port}")
+                    return 3
+                app.log(f"Cannot listen on port {port} ({exc}): another program uses it. Choose another port: "
+                        f"install.ps1 -Port <number> (or server_port in settings.toml)")
+                if args.open:
+                    show_error(f"The microscopy catalog cannot start: port {port} is used by another program.\n\n"
+                               f"Run  install.ps1 -Port <number>  (e.g. 8780) to use another port.")
                 return 3
             time.sleep(1)
     app.httpd = httpd
