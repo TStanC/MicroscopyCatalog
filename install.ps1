@@ -18,7 +18,7 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -WithMicroio <path or git URL>   optional zarr reader
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Port 8780    use another port than 8766
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Stop           stop the server
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall      stop + remove the autostart shortcut
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall      stop + remove the shortcuts
 
 param(
     [switch]$Autostart,
@@ -48,6 +48,8 @@ $tools = Join-Path $root ".tools"
 $rt = Join-Path $root ".runtime"
 $dl = Join-Path $root ".cache\downloads"
 $lnk = Join-Path ([Environment]::GetFolderPath("Startup")) "Microscopy Catalog Server.lnk"
+$startMenuLnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Microscopy Catalog.lnk"
+$folderLnk = Join-Path $root "Microscopy Catalog.lnk"
 $venvPy = Join-Path $root ".venv\Scripts\python.exe"
 $venvPyw = Join-Path $root ".venv\Scripts\pythonw.exe"
 $serve = Join-Path $root "serve_catalog.py"
@@ -111,7 +113,7 @@ function Get-JavaMajor($javaHome) {
 if ($Stop -or $Uninstall) {
     Stop-Server
     if ($Uninstall) {
-        if (Test-Path $lnk) { Remove-Item $lnk -Confirm:$false; Say "Removed autostart shortcut $lnk" }
+        foreach ($l in @($lnk, $startMenuLnk, $folderLnk)) { if (Test-Path $l) { Remove-Item $l -Confirm:$false; Say "Removed shortcut $l" } }
         Say "Stopped. To remove the program completely, delete the folder $root"
         Say "(the catalog data stays in the catalog folder, e.g. in Labdata)."
     } else { Say "Stopped." }
@@ -273,17 +275,28 @@ if ($owner) {
 $url = "http://localhost:$usePort"
 Say "  $url"
 
-# --- autostart + start ---------------------------------------------------------------------------
-if ($Autostart) {
-    $sh = New-Object -ComObject WScript.Shell
-    $sc = $sh.CreateShortcut($lnk)
+# --- shortcuts (no console window) + start ---------------------------------------------------------
+Step "Shortcuts"
+$ico = Join-Path $rt "catalog.ico"
+& $venvPy -c "import sys; sys.path.insert(0, r'$root'); from mdcat.tray import make_icon; make_icon('ok').save(r'$ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64)])"
+function New-Shortcut($path, $arguments, $description) {
+    $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
     $sc.TargetPath = $venvPyw
-    $sc.Arguments = "`"$serve`""
+    $sc.Arguments = $arguments
     $sc.WorkingDirectory = $root
-    $sc.Description = "Microscopy catalog server ($url)"
+    $sc.Description = $description
+    if (Test-Path $ico) { $sc.IconLocation = "$ico,0" }
     $sc.Save()
-    Say "Autostart shortcut: $lnk"
 }
+New-Shortcut $startMenuLnk "`"$serve`" --open" "Microscopy catalog: start the server (tray icon) and open the page"
+New-Shortcut $folderLnk "`"$serve`" --open" "Microscopy catalog: start the server (tray icon) and open the page"
+Say "  Start menu: Microscopy Catalog   (also: $folderLnk)"
+if ($Autostart) {
+    New-Shortcut $lnk "`"$serve`"" "Microscopy catalog server ($url)"
+    Say "  Autostart at login: $lnk"
+}
+$oldCmd = Join-Path $root "Start Catalog.cmd"
+if (Test-Path $oldCmd) { Remove-Item $oldCmd -Force }   # replaced by the shortcuts (no console window)
 
 if (-not $NoStart) {
     Step "Starting the server"

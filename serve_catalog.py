@@ -1,6 +1,6 @@
 """Catalog server: the catalog page with editing (missing values, comments, links) + setup.
 
-    .venv\\Scripts\\pythonw.exe serve_catalog.py [--open]     (Start Catalog.cmd does this)
+    .venv\\Scripts\\pythonw.exe serve_catalog.py [--open]     (the "Microscopy Catalog" shortcut does this)
 
 * Listens on http://localhost:<server_port> - reachable on this machine only. Only the Windows
   user who runs the server may edit; other users of the machine (RDP) can only view.
@@ -15,6 +15,8 @@
   minute.
 * Runs an incremental update every ``auto_update_min`` minutes and makes preview images in a
   separate process (make_previews.py).
+* Shows an icon in the notification area (bottom right): left click opens the catalog; right click:
+  Open catalog, Update now, Settings, Stop. Colour = status (green ok, orange offline/read-only).
 * Never writes below the Labdata root except into the catalog folder.
 """
 
@@ -409,9 +411,11 @@ def autostart(on: bool):
         return
     ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:MDCAT_LNK);"
           "$s.TargetPath=$env:MDCAT_EXE;$s.Arguments='\"'+$env:MDCAT_SCRIPT+'\"';"
-          "$s.WorkingDirectory=$env:MDCAT_DIR;$s.Description='Microscopy catalog server';$s.Save()")
+          "$s.WorkingDirectory=$env:MDCAT_DIR;$s.Description='Microscopy catalog server';"
+          "if(Test-Path $env:MDCAT_ICO){$s.IconLocation=$env:MDCAT_ICO+',0'};$s.Save()")
     env = dict(os.environ, MDCAT_LNK=STARTUP_LNK, MDCAT_EXE=pythonw(),
-               MDCAT_SCRIPT=os.path.join(HERE, "serve_catalog.py"), MDCAT_DIR=HERE)
+               MDCAT_SCRIPT=os.path.join(HERE, "serve_catalog.py"), MDCAT_DIR=HERE,
+               MDCAT_ICO=os.path.join(HERE, ".runtime", "catalog.ico"))
     r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], env=env,
                        capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=60)
     if r.returncode != 0:
@@ -598,6 +602,7 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--open", action="store_true", help="open the page in the default browser")
     ap.add_argument("--wait-port", action="store_true", help="retry binding the port for 30 s (restart)")
+    ap.add_argument("--no-tray", action="store_true", help="no notification-area icon (console use)")
     args = ap.parse_args(argv)
     cfg = mcfg.load_config(args.config)
     port = args.port or cfg.server_port
@@ -633,10 +638,25 @@ def main(argv=None) -> int:
             f"catalog folder {cfg.publish_dir or '-'}, user {app.me})")
     if args.open:
         webbrowser.open(url)
+    srv = threading.Thread(target=httpd.serve_forever, daemon=True, name="http")
+    srv.start()
+    tray = None
+    if not args.no_tray:
+        try:
+            from mdcat.tray import Tray
+            tray = Tray(app, f"http://localhost:{port}",
+                        on_stop=lambda: threading.Thread(target=httpd.shutdown, daemon=True).start())
+        except Exception as exc:  # noqa: BLE001 - no tray (e.g. pystray missing): server still works
+            app.log(f"no tray icon: {exc}")
+    if tray:
+        # the tray loop blocks the main thread; when the web server stops (Stop / restart), close it
+        threading.Thread(target=lambda: (srv.join(), tray.close()), daemon=True).start()
+        tray.run()
     try:
-        httpd.serve_forever()
+        while srv.is_alive():
+            srv.join(0.5)
     except KeyboardInterrupt:
-        pass
+        httpd.shutdown()
     app.release()
     app.log("server stopped")
     return 0

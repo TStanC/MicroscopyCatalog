@@ -24,15 +24,16 @@ cd "$env:LOCALAPPDATA\Programs\microscopy-catalog"
 powershell -ExecutionPolicy Bypass -File install.ps1 -Autostart
 ```
 
-`-Autostart` starts the server automatically when you log in. Leave it out if you would rather
-start it yourself with **Start Catalog.cmd**.
+`-Autostart` starts the server automatically when you log in, silently: only its icon appears in
+the notification area. Leave it out if you would rather start it yourself with the
+**Microscopy Catalog** shortcut, which the installer puts into the Start menu and the program folder.
 
 The script puts everything into the program folder, about 1 minute and 100–400 MB:
 
 | Folder | Content |
 |---|---|
 | `.tools\` | uv, a Python package manager (skipped if `uv` is already on the PATH) |
-| `.python\`, `.venv\` | Python 3.12 with numpy and Pillow, in the exact versions from `uv.lock` |
+| `.python\`, `.venv\` | Python 3.12 with numpy, Pillow and pystray (tray icon), in the exact versions from `uv.lock` |
 | `.runtime\jdk\` | Java (Temurin JDK 21). Only downloaded if no JDK 11 or newer is found on the machine. |
 | `.runtime\bioformats\` | `bioformats_package.jar` (Bio-Formats 8.5.0, verified by checksum) |
 | `.runtime\runtime.json` | which Java and Bio-Formats are used |
@@ -68,10 +69,18 @@ You can change the settings later with **⚙ Settings** in the header of the cat
 
 ## Using it
 
-- **Start:** the autostart shortcut, or **Start Catalog.cmd**. If the server is already
-  running, this just opens the page.
+- **Start:** the autostart shortcut, or **Microscopy Catalog** in the Start menu. No console
+  window opens. If the server is already running, the shortcut just opens the page.
+- **Tray icon** (bottom right of the taskbar; Windows may put it under the **^** arrow at first,
+  and you can drag it next to the clock):
+  - **Left click:** open the catalog.
+  - **Right click:** a menu with **Open catalog**, **Update now** (look for new data and make
+    missing previews), **Settings** and **Stop catalog server**.
+  - **Colour:** green = running, orange = offline or read-only, grey = starting, blue = not set
+    up yet. A white dot in the corner means an update or previews are running.
+  - **Hover:** the tooltip says what is going on.
 - **Page:** `http://localhost:8766`. Click a dataset to add comments or missing values.
-- **Stop:** `powershell -ExecutionPolicy Bypass -File install.ps1 -Stop`
+- **Stop:** tray icon → **Stop catalog server**, or `powershell -ExecutionPolicy Bypass -File install.ps1 -Stop`
 
 Anyone can open the catalog page read-only, without a server, at
 `<catalog folder>\index.html`.

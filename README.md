@@ -24,7 +24,10 @@ the local copy read-only and retries every minute.
 
 ## Server
 
-Started by the autostart shortcut or **Start Catalog.cmd** (`.venv\Scripts\pythonw.exe serve_catalog.py`). It
+Started by the autostart shortcut or the **Microscopy Catalog** Start-menu shortcut
+(`.venv\Scripts\pythonw.exe serve_catalog.py`, no console window). It
+* shows an icon in the notification area: left click opens the catalog; right click gives Open
+  catalog, Update now, Settings, Stop; the colour shows the status (`mdcat/tray.py`);
 * serves the catalog on `http://localhost:8766` (this machine only). Only the Windows user who
   runs the server can edit; other users of the machine (e.g. via RDP) see it read-only;
 * shows the setup page (`/setup`, **⚙ Settings** in the page header) on first start;

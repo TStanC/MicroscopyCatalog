@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "pillow>=10.0",
+    "pystray>=0.19",
 ]
 
 [tool.uv]
