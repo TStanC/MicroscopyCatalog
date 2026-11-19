@@ -328,6 +328,7 @@ button{font:inherit;background:var(--chip);color:var(--text);border:1px solid va
 button:hover{border-color:var(--accent)}button.x{padding:0 6px;margin-left:6px;color:var(--bad)}
 textarea{font:inherit;width:100%;min-height:54px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
 input.v{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:3px 6px;font:inherit;min-width:180px}
+.lb{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.82);display:none;flex-direction:column;align-items:center;justify-content:center;cursor:zoom-out}.lb img{border-radius:4px;box-shadow:0 4px 30px rgba(0,0,0,.5);background:#000}.lb .cap{color:#ddd;font-size:12px;margin-top:8px}.lb .cap a{color:#9cf}
 .toast{position:fixed;right:16px;bottom:16px;z-index:20;background:var(--panel);border:1px solid var(--accent);border-radius:8px;padding:8px 14px;box-shadow:0 2px 10px rgba(0,0,0,.2);display:none}
 .toast.err{border-color:var(--bad)}.chipc{font-size:11px;color:var(--accent)}
 table.sub th{position:static;cursor:pointer}table.sub th:hover{color:var(--accent)}
@@ -356,6 +357,7 @@ Tick columns: <b>Orig</b> original raw file, <b>Zarr</b> converted OME-Zarr, <b>
 Values with several entries (multi-image files) are separated by “;”. Missing values are listed in <span class="mono">needs_input.csv</span>; fill the <i>value</i> column and run the script again.</p></details>
 </main>
 <div class="toast" id="toast"></div>
+<div class="lb" id="lb"><img id="lbimg" alt="preview"><div class="cap" id="lbcap"></div></div>
 <script type="application/json" id="data">__DATA__</script>
 <script>
 const D=JSON.parse(document.getElementById('data').textContent);
@@ -418,7 +420,7 @@ const rg=(s,o)=>s.first===s.last?String(s.first+o):(s.first+o)+'–'+(s.last+o);
 function when(iso,ref){if(!iso)return'';const t=iso.slice(0,19).replace('T',' ');return ref&&iso.slice(0,10)===String(ref).slice(0,10)?t.slice(11):t}
 const objTxt=i=>esc(i.objective||'')+' '+esc(i.magnification?i.magnification+'x':'')+esc(i.na?'/'+i.na:'')+(i.objective_source?' <span class="src">'+esc(i.objective_source)+'</span>':'');
 const IMG_COLS=[
- {k:'preview',t:'Preview',v:i=>i.preview?1:0,h:i=>i.preview?'<a href="'+esc(i.preview)+'" target="_blank" title="open full preview"><img src="'+esc(i.preview)+'" loading="lazy" style="height:64px;max-width:160px;border-radius:3px;display:block"></a>':''},
+ {k:'preview',t:'Preview',v:i=>i.preview?1:0,h:i=>i.preview?'<a href="'+esc(i.preview)+'" target="_blank" data-lb="1" title="click to enlarge (Ctrl+click: new tab)"><img src="'+esc(i.preview)+'" loading="lazy" style="height:64px;max-width:160px;border-radius:3px;display:block"></a>':''},
  {k:'image_key',t:'Image',v:i=>i.image_key,h:i=>esc(i.image_key)},
  {k:'kind',t:'Kind',v:i=>i.kind,h:i=>esc(i.kind)},
  {k:'n_series',t:'Series/tiles',v:i=>i.n_series,h:i=>i.n_series+(i.n_tiles>1?' ('+i.n_tiles+' tiles'+(i.has_merged?' + merged':'')+')':'')+(i.n_previews?' +'+i.n_previews+' previews':'')+(i.variants?'<br><span class="src">variants: '+esc(i.variants)+'</span>':'')},
@@ -527,6 +529,18 @@ $('tb').addEventListener('change',e=>{const id=e.target.dataset&&e.target.datase
 $('tb').addEventListener('toggle',e=>{const id=e.target.dataset&&e.target.dataset.sc;if(id!==undefined)scOpen[id]=e.target.open},true);
 for(const r of D.rows)r.scenes=(r.scenes||[]).map(a=>Object.fromEntries(D.scene_keys.map((k,i)=>[k,a[i]])));
 $('unasb').addEventListener('click',e=>{const b=e.target.closest('button[data-act=link]');if(!b)return;const sel=$('lk_'+b.dataset.i);if(!sel.value)return toast('Choose a dataset',true);doEdit('/api/value',{acq_id:sel.value,image_key:'',field:'link_attachment',value:b.dataset.rel})});
+// --- preview overlay: click a preview to enlarge it (Esc / click to close, arrow keys = previous/next)
+let LB=-1;
+function lbLinks(){return [...document.querySelectorAll('a[data-lb]')]}
+function lbShow(k){const ls=lbLinks();if(!ls.length)return;LB=(k+ls.length)%ls.length;const a=ls[LB],im=$('lbimg');
+ im.onload=()=>{const s=Math.min(2,innerWidth*.96/im.naturalWidth,innerHeight*.88/im.naturalHeight);im.style.width=Math.round(im.naturalWidth*s)+'px';im.style.height='auto'};
+ im.src=a.getAttribute('href');$('lbcap').innerHTML=(LB+1)+' / '+ls.length+' · Esc or click to close · ← → previous / next · <a href="'+esc(a.getAttribute('href'))+'" target="_blank">open in new tab</a>';
+ $('lb').style.display='flex'}
+function lbHide(){$('lb').style.display='none';$('lbimg').removeAttribute('src');LB=-1}
+document.addEventListener('click',e=>{const a=e.target.closest('a[data-lb]');
+ if(a&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey&&e.button===0){e.preventDefault();e.stopPropagation();lbShow(lbLinks().indexOf(a));return}
+ if(LB>=0&&e.target.closest('#lb')&&!e.target.closest('#lbcap a')){e.preventDefault();lbHide()}},true);
+document.addEventListener('keydown',e=>{if(LB<0)return;if(e.key==='Escape')lbHide();else if(e.key==='ArrowRight')lbShow(LB+1);else if(e.key==='ArrowLeft')lbShow(LB-1);else return;e.preventDefault()});
 setMode();renderUnas();stats();render();restoreUi();
 </script></body></html>
 """
