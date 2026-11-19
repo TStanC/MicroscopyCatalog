@@ -40,6 +40,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+_VENV_SP = os.path.join(HERE, ".venv", "Lib", "site-packages")
+if os.path.isdir(_VENV_SP) and os.path.normcase(sys.prefix) != os.path.normcase(os.path.join(HERE, ".venv")):
+    import site  # started with the base interpreter's pythonw.exe (see pythonw()): use the venv's packages
+    site.addsitedir(_VENV_SP)
 
 from mdcat import comments as cm  # noqa: E402
 from mdcat import config as mcfg  # noqa: E402
@@ -66,31 +70,73 @@ class Server(ThreadingHTTPServer):
         super().server_bind()
 
 
+def is_gui_exe(path: str) -> bool:
+    """True if the .exe is a Windows GUI program (gets no console window), from its PE header."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+        pe = int.from_bytes(head[0x3C:0x40], "little")
+        return head[pe:pe + 4] == b"PE\0\0" and int.from_bytes(head[pe + 0x5C:pe + 0x5E], "little") == 2
+    except (OSError, ValueError):
+        return False
+
+
+def base_pythonw() -> str | None:
+    """pythonw.exe of the Python the venv is based on (.python\\...), from .venv\\pyvenv.cfg."""
+    try:
+        with open(os.path.join(HERE, ".venv", "pyvenv.cfg"), encoding="utf-8") as fh:
+            for line in fh:
+                k, _, v = line.partition("=")
+                if k.strip() == "home":
+                    p = os.path.join(v.strip(), "pythonw.exe")
+                    return p if os.path.exists(p) else None
+    except OSError:
+        pass
+    return None
+
+
 def pythonw() -> str:
-    for p in (os.path.join(HERE, ".venv", "Scripts", "pythonw.exe"),
-              os.path.join(os.path.dirname(sys.executable), "pythonw.exe")):
-        if os.path.exists(p):
+    """A windowless Python for (re)starting the server. The venv's pythonw.exe normally is one,
+    but on some machines it opens a console window; then the base interpreter's pythonw.exe is
+    used (the server adds the venv's packages itself, see top of this file)."""
+    venv_w = os.path.join(HERE, ".venv", "Scripts", "pythonw.exe")
+    for p in (venv_w, base_pythonw(), os.path.join(os.path.dirname(sys.executable), "pythonw.exe")):
+        if p and os.path.exists(p) and is_gui_exe(p):
             return p
-    return sys.executable
+    return venv_w if os.path.exists(venv_w) else sys.executable
+
+
+def venv_python() -> str:
+    """Interpreter for the build / preview subprocesses (started without a window)."""
+    p = os.path.join(HERE, ".venv", "Scripts", "python.exe")
+    return p if os.path.exists(p) else sys.executable
 
 
 def detach_console() -> None:
     """Run in the background: never keep or write to a console window. Depending on how the
-    server was started (PowerShell window, console python.exe), Windows hands it the console of
-    the starting window - the log lines then appeared there and the window stayed in use.
-    The log goes to .work/logs/server.log anyway."""
+    server was started (PowerShell window, console python.exe), Windows hands it a console:
+    the log lines then appeared there and the window stayed open. The log goes to
+    .work/logs/server.log anyway."""
     try:
         import ctypes
-        has_window = bool(ctypes.windll.kernel32.GetConsoleWindow())
+        k32 = ctypes.windll.kernel32
+        has_window = bool(k32.GetConsoleWindow())
     except Exception:  # noqa: BLE001
-        has_window = False
-    if has_window:
-        # started with a console window (python.exe, a terminal): start again without any console
-        # and quit - the console (and the venv launcher waiting for this process) then closes
-        subprocess.Popen([pythonw(), os.path.abspath(__file__), *sys.argv[1:]], cwd=HERE,
-                         creationflags=DETACHED, close_fds=True,
+        k32, has_window = None, False
+    if has_window and os.environ.get("MDCAT_BACKGROUND") != "1":
+        # Started with a console window: start once more without one and quit, so the window
+        # (and a venv launcher waiting for this process) closes. MDCAT_BACKGROUND marks the
+        # second start - it never restarts again, whatever happens (no loop).
+        env = dict(os.environ, MDCAT_BACKGROUND="1")
+        subprocess.Popen([pythonw(), os.path.abspath(__file__), *sys.argv[1:]], cwd=HERE, env=env,
+                         creationflags=CREATE_NO_WINDOW | 0x00000200, close_fds=True,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         sys.exit(0)
+    if has_window and k32 is not None:
+        try:
+            k32.FreeConsole()
+        except Exception:  # noqa: BLE001
+            pass
     devnull = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115 - for the process lifetime
     sys.stdout = sys.stderr = devnull
 
@@ -145,7 +191,7 @@ class Builder:
                 self.running = True
                 reason = self.last_reason
             self.app.log(f"build started ({reason})")
-            cmd = [sys.executable, os.path.join(HERE, "build_catalog.py"), "--no-previews"]
+            cmd = [venv_python(), os.path.join(HERE, "build_catalog.py"), "--no-previews"]
             if self.config_arg:
                 cmd += ["--config", self.config_arg]
             try:
@@ -191,7 +237,7 @@ class Previewer:
             time.sleep(max(60.0, (self.app.cfg.auto_update_min or 60) * 60))
 
     def run_once(self):
-        cmd = [sys.executable, os.path.join(HERE, "make_previews.py")]
+        cmd = [venv_python(), os.path.join(HERE, "make_previews.py")]
         if self.config_arg:
             cmd += ["--config", self.config_arg]
         self.running = True

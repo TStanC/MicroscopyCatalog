@@ -275,13 +275,33 @@ if ($owner) {
 $url = "http://localhost:$usePort"
 Say "  $url"
 
+# --- windowless launcher ------------------------------------------------------------------------
+function Test-GuiExe($path) {
+    # PE header subsystem 2 = Windows GUI (no console window), 3 = console
+    if (-not (Test-Path $path)) { return $false }
+    $b = [IO.File]::ReadAllBytes($path)
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    return ([BitConverter]::ToUInt16($b, $pe + 0x5C) -eq 2)
+}
+$launcher = $venvPyw
+if (-not (Test-GuiExe $venvPyw)) {
+    $home_ = ((Get-Content (Join-Path $root ".venv\pyvenv.cfg")) | Where-Object { $_ -match '^\s*home\s*=' }) -replace '^\s*home\s*=\s*', ''
+    $basePyw = Join-Path $home_.Trim() "pythonw.exe"
+    if (Test-GuiExe $basePyw) {
+        $launcher = $basePyw
+        Say "  note: .venv\Scripts\pythonw.exe would open a console window on this machine - using $basePyw"
+    } else {
+        Say "  WARNING: no windowless pythonw.exe found - the server may show a console window"
+    }
+}
+
 # --- shortcuts (no console window) + start ---------------------------------------------------------
 Step "Shortcuts"
 $ico = Join-Path $rt "catalog.ico"
 & $venvPy -c "import sys; sys.path.insert(0, r'$root'); from mdcat.tray import make_icon; make_icon('ok').save(r'$ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64)])"
 function New-Shortcut($path, $arguments, $description) {
     $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-    $sc.TargetPath = $venvPyw
+    $sc.TargetPath = $launcher
     $sc.Arguments = $arguments
     $sc.WorkingDirectory = $root
     $sc.Description = $description
@@ -300,7 +320,7 @@ if (Test-Path $oldCmd) { Remove-Item $oldCmd -Force }   # replaced by the shortc
 
 if (-not $NoStart) {
     Step "Starting the server"
-    Start-Process -FilePath $venvPyw -ArgumentList "`"$serve`"", "--open", "--wait-port" -WorkingDirectory $root
+    Start-Process -FilePath $launcher -ArgumentList "`"$serve`"", "--open", "--wait-port" -WorkingDirectory $root
     $ok = $false
     for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
         Start-Sleep -Seconds 1
