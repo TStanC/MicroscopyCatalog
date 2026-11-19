@@ -67,8 +67,32 @@ class Server(ThreadingHTTPServer):
 
 
 def pythonw() -> str:
-    p = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    return p if os.path.exists(p) else sys.executable
+    for p in (os.path.join(HERE, ".venv", "Scripts", "pythonw.exe"),
+              os.path.join(os.path.dirname(sys.executable), "pythonw.exe")):
+        if os.path.exists(p):
+            return p
+    return sys.executable
+
+
+def detach_console() -> None:
+    """Run in the background: never keep or write to a console window. Depending on how the
+    server was started (PowerShell window, console python.exe), Windows hands it the console of
+    the starting window - the log lines then appeared there and the window stayed in use.
+    The log goes to .work/logs/server.log anyway."""
+    try:
+        import ctypes
+        has_window = bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:  # noqa: BLE001
+        has_window = False
+    if has_window:
+        # started with a console window (python.exe, a terminal): start again without any console
+        # and quit - the console (and the venv launcher waiting for this process) then closes
+        subprocess.Popen([pythonw(), os.path.abspath(__file__), *sys.argv[1:]], cwd=HERE,
+                         creationflags=DETACHED, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sys.exit(0)
+    devnull = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115 - for the process lifetime
+    sys.stdout = sys.stderr = devnull
 
 
 class Builder:
@@ -267,7 +291,10 @@ class App:
     # --- logging ---------------------------------------------------------------------------
     def log(self, msg: str):
         line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except (OSError, ValueError, AttributeError):  # console gone / none
+            pass
         try:
             with safety.open_write(self.server_log, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
@@ -602,8 +629,11 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--open", action="store_true", help="open the page in the default browser")
     ap.add_argument("--wait-port", action="store_true", help="retry binding the port for 30 s (restart)")
-    ap.add_argument("--no-tray", action="store_true", help="no notification-area icon (console use)")
+    ap.add_argument("--no-tray", action="store_true", help="no notification-area icon")
+    ap.add_argument("--console", action="store_true", help="stay in the console and print the log (debugging)")
     args = ap.parse_args(argv)
+    if not args.console:
+        detach_console()
     cfg = mcfg.load_config(args.config)
     port = args.port or cfg.server_port
     if cfg.configured:
