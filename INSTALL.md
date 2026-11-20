@@ -76,7 +76,7 @@ You can change the settings later with **⚙ Settings** in the header of the cat
   - **Left click:** open the catalog.
   - **Right click:** a menu with **Open catalog**, **Update now** (look for new data and make
     missing previews), **Settings** and **Stop catalog server**.
-  - **Colour:** green = running, orange = offline or read-only, grey = starting, blue = not set
+  - **Colour:** green = running, orange = offline (or read-only because an old server version still runs elsewhere), grey = starting, blue = not set
     up yet. A white dot in the corner means an update or previews are running.
   - **Hover:** the tooltip says what is going on.
 - **Page:** `http://localhost:8766`. Click a dataset to add comments or missing values.
@@ -104,25 +104,34 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall   # stops the se
 Then delete the program folder. The catalog itself (database, comments, previews) stays in the
 catalog folder.
 
-## Several machines
+## Several machines and users
 
-Only one server at a time maintains a catalog folder. It holds a lock file, `server.lock` in the
-catalog folder, and refreshes it every 2 minutes.
+Any number of servers can use the same catalog folder at the same time, and everyone can add
+comments and values.
 
-- **A second server** (another machine, or another user on the same machine) shows the catalog
-  read-only. The header of its page says which server owns the folder.
-- **Taking over:** the second server takes over automatically once the first one has been stopped
-  for 10 minutes, for example because that machine was switched off.
-- **Moving the server:** stop the server on the old machine (`install.ps1 -Stop` or
-  `-Uninstall`), then install it on the new one. The new machine pulls the whole catalog from the
-  catalog folder on its first start.
+- **Several machines:** install the server on each one and choose the same catalog folder. A new
+  machine shows the existing catalog right away; it does not need its own first build.
+- **Several users on one machine** (e.g. via RDP): they all use the server that runs there. Each
+  person's edits are saved under their own Windows user name. Only the user who runs the server
+  can change its settings.
+- **What happens to an edit:** it is saved at once into `inbox\` in the catalog folder and shown
+  as *pending*. The next catalog update (on whichever machine; usually within a few minutes)
+  applies it, and the page reloads by itself.
+- **Two people change the same value:** the first change is applied. The second one is not
+  applied if it was made without seeing the first one; the dataset then shows it under
+  **Edits not applied**, with the current value, so it can be entered again if needed.
+- **Updates:** only one machine at a time updates the catalog (`build.lock` in the catalog folder,
+  present only while an update runs). The others wait their turn.
+- **Updating from an older version:** an old server (before the inbox) keeps the catalog folder to
+  itself. While one still runs, newer servers stay read-only - update all machines.
 
 ## Troubleshooting
 
 | Problem | What to do |
 |---|---|
 | The page says "Labdata folder not reachable" or "catalog folder not usable" | Connect the network drive or VPN. The server shows the last local copy and retries every minute. |
-| The page says "read-only: maintained by the server of …" | Another server owns the catalog folder (see *Several machines*). |
+| The page says "read-only: an older version of the catalog server … still maintains the catalog folder" | Update the program on the machine named there (see *Updating*). |
+| Edits stay *pending* for a long time | Another machine is running a long update (e.g. the very first one); they are applied after it. `build.lock` in the catalog folder says which machine. |
 | The setup page shows Java or Bio-Formats as missing | Run `install.ps1` again. |
 | The download fails (proxy, firewall) | Run `install.ps1` again (finished downloads are reused). If it keeps failing, download the JDK yourself and pass `-JavaHome`. |
 | Another program already uses port 8766 | The installer then picks the next free port (it tells you which one, e.g. `http://localhost:8767`) and saves it in `settings.toml`. To choose one yourself: `install.ps1 -Port 8780`. |

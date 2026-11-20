@@ -2,18 +2,23 @@
 
     .venv\\Scripts\\pythonw.exe serve_catalog.py [--open]     (the "Microscopy Catalog" shortcut does this)
 
-* Listens on http://localhost:<server_port> - reachable on this machine only. Only the Windows
-  user who runs the server may edit; other users of the machine (RDP) can only view.
+* Listens on http://localhost:<server_port> - reachable on this machine only. Every Windows
+  user of the machine (also via RDP) can add comments and values under their own name
+  (identified from the connection, mdcat/winuser.py); only the user who runs the server may
+  change its settings.
 * First start (no settings.toml): the page /setup asks for the Labdata folder and the catalog
   folder; saving restarts the server with the new settings.
-* The catalog folder is the master copy. The server works on a local copy (.work), pulls the
-  catalog folder when it is newer and copies every change back within seconds (each build).
-* Only one server at a time maintains a catalog folder (server.lock there, heartbeat every
-  2 min). A second server shows the catalog read-only; it takes over when the lock is
-  older than 10 minutes (other machine off / server stopped).
+* The catalog folder is the master copy, shared by any number of servers (machines/users).
+  Edits are written into its inbox at once (mdcat/inbox.py, no lock) and shown on the page
+  as "pending"; the next build - on whichever machine - applies them one after the other.
+* A build holds build.lock in the catalog folder while it runs (one build at a time across
+  machines); a server whose build finds the lock taken retries while edits are waiting.
+* The page shown is the newest one: the catalog folder's if another machine published since
+  this server's last build, else the local copy (.work).
 * Network drive / VPN not available: shows the last local copy read-only and retries every
   minute.
-* Runs an incremental update every ``auto_update_min`` minutes and makes preview images in a
+* Updates the catalog when the last published update is older than ``auto_update_min``
+  minutes (whoever notices first) and, after its own builds, makes preview images in a
   separate process (make_previews.py).
 * Shows an icon in the notification area (bottom right): left click opens the catalog; right click:
   Open catalog, Update now, Settings, Stop. Colour = status (green ok, orange offline/read-only).
@@ -23,7 +28,6 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import getpass
 import json
 import os
@@ -37,6 +41,7 @@ import time
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -47,7 +52,7 @@ if os.path.isdir(_VENV_SP) and os.path.normcase(sys.prefix) != os.path.normcase(
 
 from mdcat import comments as cm  # noqa: E402
 from mdcat import config as mcfg  # noqa: E402
-from mdcat import lease, locks, safety, setup_page, sync, winuser  # noqa: E402
+from mdcat import inbox, lease, safety, setup_page, sync, winuser  # noqa: E402
 from mdcat import overrides as ov  # noqa: E402
 
 INJECT_BEFORE = b'<script type="application/json" id="data">'
@@ -55,7 +60,9 @@ CREATE_NO_WINDOW = 0x08000000
 DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup",
                            "Microscopy Catalog Server.lnk")
-EXIT_MSG = {2: "not set up", 4: "Labdata folder not reachable", 5: "catalog folder is maintained by another server"}
+EXIT_MSG = {2: "not set up", 4: "Labdata folder not reachable", 5: "a build is running on another machine"}
+BUSY_RETRY_S = 60          # build.lock taken by another machine and edits waiting: try again
+CHECK_EVERY_S = 300        # how often the server checks whether an update is due
 
 
 class Server(ThreadingHTTPServer):
@@ -154,11 +161,11 @@ class Builder:
         self.last_ok: bool | None = None
         self.last_error = ""
         self.last_finished = ""
+        self.last_ok_epoch = 0.0
         self.last_reason = ""
         self.tail: list[str] = []
         threading.Thread(target=self._loop, daemon=True, name="builder").start()
-        if app.cfg.auto_update_min and app.cfg.auto_update_min > 0:
-            threading.Thread(target=self._timer, daemon=True, name="auto-update").start()
+        threading.Thread(target=self._timer, daemon=True, name="auto-update").start()
 
     def request(self, reason: str) -> int:
         with self.lock:
@@ -174,10 +181,14 @@ class Builder:
                     "last_error": self.last_error, "last_finished": self.last_finished, "tail": self.tail[-15:]}
 
     def _timer(self):
+        """Every few minutes: start a build if one is due (old catalog, waiting edits). With
+        several servers, the first one that notices builds; the others then see a fresh catalog."""
         while True:
-            time.sleep(self.app.cfg.auto_update_min * 60)
-            if self.app.status == "ok":
-                self.request("scheduled update")
+            time.sleep(CHECK_EVERY_S)
+            if self.app.status == "ok" and not self.running and not self.pending:
+                reason = self.app.build_due(edits_older_than_s=120)
+                if reason:
+                    self.request(reason)
 
     def _loop(self):
         while True:
@@ -209,50 +220,107 @@ class Builder:
                     threading.Timer(15, self.wake.set).start()
                     self.app.log("build busy (another build running) - retrying in 15 s")
                     continue
+            if code == 5:  # build.lock held by another machine: it does the update
+                # it may have read the inbox before our edit, or not have our newest previews: try again
+                if self.app.edits_waiting() or self.app.previews_unlinked:
+                    with self.lock:
+                        self.pending = True
+                    threading.Timer(BUSY_RETRY_S, self.wake.set).start()
+                    self.app.log(f"build skipped ({lines[-1] if lines else 'catalog folder busy'}) - "
+                                 f"edits waiting, retrying in {BUSY_RETRY_S} s")
+                else:
+                    self.app.log(f"build skipped: {lines[-1] if lines else 'catalog folder busy'}")
+                self.app.supervise_now()
+                continue
+            with self.lock:
                 self.last_ok = code == 0
                 self.last_error = "" if code == 0 else (lines[-1] if lines else EXIT_MSG.get(code, f"exit code {code}"))
                 self.last_finished = datetime.now().isoformat(timespec="seconds")
+                if code == 0:
+                    self.last_ok_epoch = time.time()
+                    self.app.previews_unlinked = False
                 self.generation += 1
             self.app.log(f"build finished: {'ok' if code == 0 else 'FAILED: ' + self.last_error}")
-            if code in (4, 5):
+            if code == 4:
                 self.app.supervise_now()
 
 
 class Previewer:
-    """Runs make_previews.py (own lock, never blocks builds) after start and every auto_update_min;
-    when new previews were made, a quick build links + publishes them."""
+    """Runs make_previews.py after every successful build of this server (and from the tray), until
+    all previews are made or preview_budget_min (default 23 h) is used up. It never holds
+    build.lock, so edits keep being applied meanwhile; preview.lock in the catalog folder lets one
+    machine render at a time (the others skip). Every new preview is copied to the catalog folder
+    at once; during a long run a build links the new ones into the page every LINK_EVERY_S, and
+    once more at the end."""
+
+    LINK_EVERY_S = 3600
 
     def __init__(self, app, config_arg):
         self.app, self.config_arg = app, config_arg
         self.running = False
         self.last = ""
+        self.last_run_epoch = 0.0
+        self._lock = threading.Lock()
         if app.cfg.previews_on:
             threading.Thread(target=self._loop, daemon=True, name="previews").start()
 
     def _loop(self):
-        time.sleep(90)  # let the start-up build finish first
         while True:
-            if self.app.status == "ok":
+            time.sleep(60)
+            b = self.app.builder
+            if self.app.status == "ok" and not self.running and b.last_ok_epoch > self.last_run_epoch:
                 self.run_once()
-            time.sleep(max(60.0, (self.app.cfg.auto_update_min or 60) * 60))
+
+    def _newest_preview_mtime(self) -> float:
+        try:
+            return max((e.stat().st_mtime for e in os.scandir(os.path.join(self.app.cfg.out_dir, "previews"))
+                        if e.name.endswith(".jpg")), default=0.0)
+        except OSError:
+            return 0.0
 
     def run_once(self):
+        with self._lock:
+            if self.running:
+                return
+            self.running = True
         cmd = [venv_python(), os.path.join(HERE, "make_previews.py")]
         if self.config_arg:
             cmd += ["--config", self.config_arg]
-        self.running = True
+        self.last_run_epoch = time.time()
         self.app.log("previews started")
+        last_line = []
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                  creationflags=CREATE_NO_WINDOW, cwd=HERE)
-            lines = [ln for ln in (proc.stdout or "").splitlines() if ln.startswith("PREVIEWS ")]
-            self.last = lines[-1] if lines else f"exit code {proc.returncode}"
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW, cwd=HERE)
+
+            def read():  # drain the output (a long run prints a line per file)
+                for ln in proc.stdout:
+                    if ln.startswith("PREVIEWS "):
+                        last_line[:] = [ln.strip()]
+
+            reader = threading.Thread(target=read, daemon=True, name="previews-out")
+            reader.start()
+            linked = self._newest_preview_mtime()
+            next_link = time.time() + self.LINK_EVERY_S
+            while proc.poll() is None:
+                time.sleep(10)
+                if time.time() >= next_link:  # long run: show what is there so far
+                    next_link = time.time() + self.LINK_EVERY_S
+                    newest = self._newest_preview_mtime()
+                    if newest > linked:
+                        linked = newest
+                        self.app.previews_unlinked = True
+                        self.app.builder.request("link new previews")
+            reader.join(30)
+            self.last = last_line[0] if last_line else f"exit code {proc.returncode}"
         except OSError as exc:
             self.last = str(exc)
         finally:
             self.running = False
         self.app.log(f"previews finished: {self.last}")
-        if "made=" in self.last and "made=0 " not in self.last:
+        counts = {k: int(v) for k, v in re.findall(r"\b(made|fetched)=(\d+)", self.last)}
+        if counts.get("made") or counts.get("fetched"):
+            self.app.previews_unlinked = True
             self.app.builder.request("new previews")
 
 
@@ -260,16 +328,12 @@ class App:
     def __init__(self, cfg, config_arg):
         self.cfg, self.config_arg = cfg, config_arg
         self.me = getpass.getuser()
-        self.p_over = os.path.join(cfg.out_dir, "manual_overrides.csv")
-        self.audit_path = os.path.join(cfg.out_dir, "logs", "web_edits.log")
         self.server_log = os.path.join(cfg.out_dir, "logs", "server.log")
         self.actions = {"/api/value": self.set_value, "/api/comment": self.add_comment,
                         "/api/comment/delete": self.delete_comment}
-        self.status = "ok" if cfg.configured else "setup"   # setup | offline | readonly | ok
+        self.status = "ok" if cfg.configured else "setup"   # setup | starting | offline | readonly | ok
         self.status_msg = "" if cfg.configured else "not set up yet"
-        self.holder: dict | None = None
-        self.owns_lock = False
-        self.last_beat = 0.0
+        self.previews_unlinked = False   # new previews made here that no build has linked yet
         self.httpd: Server | None = None
         self._wake = threading.Event()
         if cfg.configured:
@@ -301,38 +365,76 @@ class App:
     def supervise(self):
         cfg = self.cfg
         if not os.path.isdir(cfg.labdata_root):
-            self.owns_lock = False
             return self._set("offline", f"Labdata folder {cfg.labdata_root} not reachable (network drive / VPN?) - "
                                         f"showing the last local copy, retrying every minute")
         try:
             safety.configure_publish(cfg.publish_dir)
-            if self.owns_lock:
-                if time.time() - self.last_beat < lease.HEARTBEAT_S:
-                    return
-                holder = lease.heartbeat(cfg.publish_dir)
-            else:
-                holder = lease.acquire(cfg.publish_dir)
+            os.listdir(cfg.publish_dir)
+            old = lease.legacy_holder(cfg.publish_dir)
         except (OSError, RuntimeError) as exc:
-            self.owns_lock = False
             return self._set("offline", f"catalog folder not usable ({exc}) - retrying every minute")
-        if holder:
-            self.owns_lock, self.holder = False, holder
-            return self._set("readonly", f"read-only: the catalog folder is maintained by the server of "
-                                         f"{lease.describe(holder)}. This server takes over when that one has "
-                                         f"been stopped for 10 minutes.")
-        self.last_beat = time.time()
-        if not self.owns_lock:
-            self.owns_lock, self.holder = True, None
-            self._set("ok", f"catalog folder {cfg.publish_dir}")
-            self.builder.request("server start" if self.builder.generation == 0 else "back online")
+        if old:
+            return self._set("readonly", f"read-only: an older version of the catalog server ({lease.describe(old)}) "
+                                         f"still maintains the catalog folder - update the program there "
+                                         f"(git pull + install.ps1), then edits are possible here")
+        was = self.status
+        self._set("ok", f"catalog folder {cfg.publish_dir}")
+        if was != "ok":
+            reason = self.build_due()
+            if reason:
+                self.builder.request(reason)
 
-    def release(self):
-        if self.owns_lock:
+    # --- catalog folder state ----------------------------------------------------------------
+    def share_generation(self) -> int:
+        try:
+            return int(sync.share_state(self.cfg).get("generation", 0))
+        except (OSError, ValueError):
+            return 0
+
+    def local_generation(self) -> int:
+        try:
+            return int(sync.local_state(self.cfg).get("generation", 0))
+        except (OSError, ValueError):
+            return 0
+
+    def published_age_s(self) -> float | None:
+        """Seconds since the catalog folder was last published (None: never / unknown)."""
+        try:
+            t = sync.share_state(self.cfg).get("time")
+            return (datetime.now() - datetime.fromisoformat(t)).total_seconds() if t else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def pending_edits(self) -> list[dict]:
+        try:
+            return inbox.pending(self.cfg.publish_dir)
+        except OSError:
+            return []
+
+    def edits_waiting(self, older_than_s: float = 0) -> bool:
+        if older_than_s <= 0:
+            return bool(self.pending_edits())
+        cutoff = time.time() - older_than_s
+        for e in self.pending_edits():
             try:
-                lease.release(self.cfg.publish_dir)
-            except (OSError, RuntimeError):
-                pass
-            self.owns_lock = False
+                if datetime.fromisoformat(str(e.get("ts", ""))).timestamp() <= cutoff:
+                    return True
+            except ValueError:
+                return True
+        return False
+
+    def build_due(self, edits_older_than_s: float = 0) -> str | None:
+        """Reason to start a build now, else None. Edits are normally applied by the build the
+        submitting server starts; ``edits_older_than_s`` lets the periodic check pick up ones
+        whose server stopped before that build."""
+        age = self.published_age_s()
+        if age is None:
+            return "first build"
+        if self.cfg.auto_update_min and age > self.cfg.auto_update_min * 60:
+            return "scheduled update"
+        if self.edits_waiting(edits_older_than_s):
+            return "edits waiting in the inbox"
+        return None
 
     # --- logging ---------------------------------------------------------------------------
     def log(self, msg: str):
@@ -347,58 +449,72 @@ class App:
         except OSError:
             pass
 
-    def audit(self, user: str, action: str, payload: dict):
-        rec = {"ts": datetime.now().isoformat(timespec="seconds"), "user": user, "action": action, **payload}
-        with safety.open_write(self.audit_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
     def is_owner(self, user: str | None) -> bool:
         return bool(user) and user.lower() == self.me.lower()
 
     def can_edit(self, user: str | None) -> bool:
-        return self.status == "ok" and self.is_owner(user)
+        """Any identified Windows user of this machine may comment / enter values (as themselves)."""
+        return self.status == "ok" and bool(user)
+
+    def edit_refusal(self, user: str | None) -> str:
+        if not user:
+            return "your Windows user could not be identified - editing is not possible"
+        return f"editing is not possible now: {self.status_msg}"
 
     def known_acq(self, acq_id: str) -> bool:
-        db = sqlite3.connect(f"file:{self.cfg.db_path}?mode=ro", uri=True, timeout=30)
-        try:
-            return db.execute("SELECT 1 FROM acquisitions WHERE acq_id=?", (acq_id,)).fetchone() is not None
-        finally:
-            db.close()
+        """Dataset in the local copy or - if another machine published since - the catalog folder."""
+        cands = [(self.cfg.db_path, "?mode=ro")]
+        if self.cfg.publish_dir:  # immutable: no locking on the share (replaced atomically, never written live)
+            cands.append((os.path.join(self.cfg.publish_dir, "catalog.sqlite"), "?mode=ro&immutable=1"))
+        for path, opts in cands:
+            if not os.path.exists(path):
+                continue
+            try:
+                db = sqlite3.connect(Path(path).absolute().as_uri() + opts, uri=True, timeout=30)
+                try:
+                    if db.execute("SELECT 1 FROM acquisitions WHERE acq_id=?", (acq_id,)).fetchone():
+                        return True
+                finally:
+                    db.close()
+            except sqlite3.Error:
+                continue
+        return False
 
-    # --- edit actions (each returns a short description for the audit log) ---
-    def set_value(self, user: str, b: dict) -> str:
-        acq, field, value = str(b.get("acq_id", "")), str(b.get("field", "")), str(b.get("value", ""))
-        image_key = str(b.get("image_key", ""))
+    # --- edit actions: validated here, written to the inbox, applied by the next build ---
+    def _submit(self, user: str, action: str, **fields) -> dict:
+        e = inbox.new_entry(action, user, **fields)
+        name = inbox.submit(self.cfg.publish_dir, e)
+        self.log(f"{user}: {action} -> inbox/{name}")
+        return inbox.public(e)
+
+    def set_value(self, user: str, b: dict) -> dict:
+        acq, field, value = str(b.get("acq_id", "")), str(b.get("field", "")), str(b.get("value", "")).strip()
+        image_key, old = str(b.get("image_key", "")), str(b.get("old_value", "")).strip()
+        if field not in ov.ALL_FIELDS:
+            raise ValueError(f"unknown field {field!r}")
         if not self.known_acq(acq):
             raise ValueError(f"unknown dataset {acq!r}")
-        with locks.edit_lock(self.cfg):
-            if value.strip():
-                ov.set_override(self.p_over, acq, image_key, field, value,
-                                note=f"web {user} {datetime.now():%Y-%m-%d %H:%M}")
-                return f"set {field}={value!r}"
-            removed = ov.remove_override(self.p_over, acq, image_key, field, str(b.get("old_value", "")))
-            if not removed:
-                raise ValueError("value not found (already removed?)")
-            return f"removed {field}"
+        if value:
+            ov.parse_value(field, value)  # raises ValueError with a helpful message
+            return self._submit(user, "value_set", acq_id=acq, image_key=ov.norm_key(field, image_key),
+                                field=field, value=value, old_value=old)
+        if not old:
+            raise ValueError("no value to remove")
+        return self._submit(user, "value_remove", acq_id=acq, image_key=ov.norm_key(field, image_key),
+                            field=field, old_value=old)
 
-    def add_comment(self, user: str, b: dict) -> str:
+    def add_comment(self, user: str, b: dict) -> dict:
         acq = str(b.get("acq_id", ""))
+        text = cm.check_text(str(b.get("text", "")))
         if not self.known_acq(acq):
             raise ValueError(f"unknown dataset {acq!r}")
-        db = cm.connect(self.cfg.db_path)
-        try:
-            row = cm.add_comment(db, acq, str(b.get("text", "")), user, str(b.get("image_key", "")))
-        finally:
-            db.close()
-        return f"comment {row['comment_id']}"
+        return self._submit(user, "comment_add", acq_id=acq, image_key=str(b.get("image_key", "")), text=text)
 
-    def delete_comment(self, user: str, b: dict) -> str:
-        db = cm.connect(self.cfg.db_path)
-        try:
-            cm.delete_comment(db, str(b.get("comment_id", "")), user)
-        finally:
-            db.close()
-        return f"deleted comment {b.get('comment_id')}"
+    def delete_comment(self, user: str, b: dict) -> dict:
+        cid = str(b.get("comment_id", ""))
+        if not re.fullmatch(r"[0-9a-f]{8,10}", cid):
+            raise ValueError("invalid comment id")
+        return self._submit(user, "comment_delete", acq_id=str(b.get("acq_id", "")), comment_id=cid)
 
     # --- setup -----------------------------------------------------------------------------
     def setup_state(self) -> dict:
@@ -425,13 +541,14 @@ class App:
             ci = f'<span class="bad">{esc(problem)}</span>'
         elif os.path.exists(os.path.join(cat, "catalog.sqlite")):
             st = sync.share_state(type("C", (), {"publish_dir": cat})())
-            h = lease.read(cat)
             when = (f' (last written by {esc(st["host"])} {esc(str(st.get("time", "")).replace("T", " "))})'
                     if st.get("host") else "")
-            ci = f'<span class="ok">existing catalog found</span>{when} – it will be used'
-            if h and lease.other_holder(cat):
-                ci += f'<br><span class="warn">currently maintained by the server of {esc(lease.describe(h))} – ' \
-                      f'this one will be read-only until that one stops</span>'
+            ci = f'<span class="ok">existing catalog found</span>{when} – it will be used (shared with the ' \
+                 f'other catalog servers that use it)'
+            old = lease.legacy_holder(cat)
+            if old:
+                ci += f'<br><span class="warn">still maintained by an older catalog server ({esc(lease.describe(old))}) ' \
+                      f'– this one stays read-only until that one is updated</span>'
         elif os.path.isdir(cat):
             ci = ('<span class="warn">empty folder – a new catalog is built: the first run reads the metadata '
                   'of all files (hours for a large Labdata folder)</span>')
@@ -454,8 +571,8 @@ class App:
         if prev not in mcfg.PREVIEW_MODES:
             raise ValueError("unknown preview mode")
         try:
-            upd = max(0.0, float(b.get("auto_update_min", 60)))
-            budget = max(1.0, float(b.get("preview_budget_min", 20)))
+            upd = max(0.0, float(b.get("auto_update_min", 1440)))
+            budget = max(1.0, float(b.get("preview_budget_min", 1380)))
         except (TypeError, ValueError):
             raise ValueError("minutes must be numbers") from None
         mcfg.write_settings({"labdata_root": lab, "catalog_dir": cat, "auto_update_min": upd,
@@ -466,7 +583,6 @@ class App:
     def restart(self):
         """Start a fresh server process (new settings) and stop this one."""
         self.log("restarting with new settings")
-        self.release()
         cmd = [pythonw(), os.path.join(HERE, "serve_catalog.py"), "--wait-port"]
         if self.config_arg:
             cmd += ["--config", self.config_arg]
@@ -547,17 +663,22 @@ def make_handler(app: App, port: int):
         def _host_ok(self) -> bool:  # blocks DNS-rebinding style access from other origins
             return self.headers.get("Host", "") in allowed_hosts
 
-        def _page(self) -> bytes | None:
-            cands = [os.path.join(app.cfg.out_dir, "catalog.html")]
-            if app.status == "readonly":  # the owning server keeps the catalog folder current
-                cands.insert(0, os.path.join(app.cfg.publish_dir, "index.html"))
-            for p in cands:
+        def _page(self) -> tuple[bytes, int] | tuple[None, int]:
+            """The newest catalog page and its generation: the catalog folder's when another
+            machine published after this server's last build, else the local copy."""
+            sh, lo = app.share_generation(), app.local_generation()
+            local = (os.path.join(app.cfg.out_dir, "catalog.html"), lo)
+            share = (os.path.join(app.cfg.publish_dir, "index.html"), sh) if app.cfg.publish_dir else None
+            cands = [share, local] if share and sh > lo else [local, share]
+            for c in cands:
+                if not c:
+                    continue
                 try:
-                    with open(p, "rb") as fh:
-                        return fh.read()
+                    with open(c[0], "rb") as fh:
+                        return fh.read(), c[1]
                 except OSError:
                     continue
-            return None
+            return None, 0
 
         def do_GET(self):
             if not self._host_ok():
@@ -568,14 +689,15 @@ def make_handler(app: App, port: int):
                     return self._send(302, b"", "text/plain", {"Location": "/setup"})
                 return self._send(200, setup_page.render(app.setup_state()), "text/html; charset=utf-8")
             if path in ("/", "/index.html"):
-                page = self._page()
+                page, page_gen = self._page()
                 if page is None:
                     msg = (f"The catalog is being built for the first time ({app.status_msg}). "
                            f"Reload in a minute - or open http://localhost:{port}/setup")
                     return self._send(503, msg.encode("utf-8"), "text/plain; charset=utf-8")
                 user = self._user()
                 info = {"user": user or "", "can_edit": app.can_edit(user), "status": app.status,
-                        "status_msg": app.status_msg, "owner": app.me}
+                        "status_msg": app.status_msg if app.can_edit(user) or app.status != "ok"
+                        else app.edit_refusal(user), "owner": app.me, "page_generation": page_gen}
                 inject = b"<script>window.MDCAT_SERVER=" + json.dumps(info).encode("utf-8") + b";</script>\n"
                 page = page.replace(INJECT_BEFORE, inject + INJECT_BEFORE, 1)
                 return self._send(200, page, "text/html; charset=utf-8")
@@ -594,11 +716,30 @@ def make_handler(app: App, port: int):
             if path == "/api/state":
                 user = self._user()
                 b = app.builder
+                holder = None
+                if app.cfg.publish_dir and app.status == "ok":
+                    try:
+                        h = lease.current_holder(app.cfg.publish_dir)
+                        holder = lease.describe(h) if h else None
+                    except OSError:
+                        pass
                 return self._json(200, {"user": user or "", "can_edit": app.can_edit(user), "status": app.status,
                                         "status_msg": app.status_msg,
                                         "generation": b.generation if b else 0, "build": b.state() if b else {},
+                                        "catalog_generation": max(app.share_generation(), app.local_generation()),
+                                        "building": holder,
                                         "previews": {"running": app.previewer.running, "last": app.previewer.last}
                                         if app.previewer else {}})
+            if path == "/api/pending":
+                if not app.cfg.publish_dir or app.status not in ("ok", "readonly"):
+                    return self._json(200, {"pending": [], "conflicts": [], "failed": []})
+                try:
+                    pdir = app.cfg.publish_dir
+                    return self._json(200, {"pending": [inbox.public(e) for e in inbox.pending(pdir)],
+                                            "conflicts": [inbox.public(e) for e in inbox.recent(pdir, "conflict")],
+                                            "failed": [inbox.public(e) for e in inbox.recent(pdir, "failed")]})
+                except OSError as exc:
+                    return self._json(200, {"pending": [], "conflicts": [], "failed": [], "error": str(exc)})
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
@@ -609,12 +750,15 @@ def make_handler(app: App, port: int):
                     or not self.headers.get("Content-Type", "").startswith("application/json")):
                 return self._json(403, {"ok": False, "error": "forbidden"})
             user = self._user()
-            if not app.is_owner(user):
+            owner_only = path in ("/api/check", "/api/pickfolder", "/api/setup", "/api/rebuild")
+            if owner_only and not app.is_owner(user):
                 return self._json(403, {"ok": False, "error": f"only {app.me} (who runs this server) may change "
-                                                              f"things here - you are {user or '?'}"})
+                                                              f"its settings - you are {user or '?'}"})
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(min(n, 100_000)) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
             except (ValueError, json.JSONDecodeError):
                 return self._json(400, {"ok": False, "error": "invalid JSON"})
             try:
@@ -628,21 +772,19 @@ def make_handler(app: App, port: int):
                     self._json(200, {"ok": True, "result": what})
                     threading.Timer(0.5, app.restart).start()
                     return None
-                if not app.can_edit(user):
-                    return self._json(403, {"ok": False, "error": f"editing is not possible now: {app.status_msg}"})
-                if path == "/api/rebuild":
-                    what = "rebuild requested"
-                elif path in actions:
-                    what = actions[path](user, body)
-                else:
+                if path not in actions and path != "/api/rebuild":
                     return self._json(404, {"ok": False, "error": "unknown action"})
+                if not app.can_edit(user):
+                    return self._json(403, {"ok": False, "error": app.edit_refusal(user)})
+                if path == "/api/rebuild":
+                    app.log(f"{user}: rebuild requested")
+                    return self._json(200, {"ok": True, "result": "rebuild requested",
+                                            "generation": app.builder.request(f"requested by {user}")})
+                entry = actions[path](user, body)
             except (ValueError, TimeoutError, subprocess.TimeoutExpired, OSError) as exc:
                 return self._json(400, {"ok": False, "error": str(exc)})
-            app.audit(user, path, {"result": what, **{k: v for k, v in body.items() if k != "text"},
-                                   **({"text": body["text"]} if "text" in body else {})})
-            app.log(f"{user}: {path} {what}")
-            gen = app.builder.request(f"edit by {user}")
-            return self._json(200, {"ok": True, "result": what, "generation": gen})
+            app.builder.request(f"edit by {user}")
+            return self._json(200, {"ok": True, "entry": entry})
 
         def do_OPTIONS(self):  # no CORS - refuse preflights
             self._send(403, b"", "text/plain")
@@ -708,7 +850,6 @@ def main(argv=None) -> int:
                 return 3
             time.sleep(1)
     app.httpd = httpd
-    atexit.register(app.release)
     url = f"http://localhost:{port}" + ("" if cfg.configured else "/setup")
     app.log(f"catalog server on {url} (program {HERE}, working copy {cfg.out_dir}, "
             f"catalog folder {cfg.publish_dir or '-'}, user {app.me})")
@@ -733,7 +874,6 @@ def main(argv=None) -> int:
             srv.join(0.5)
     except KeyboardInterrupt:
         httpd.shutdown()
-    app.release()
     app.log("server stopped")
     return 0
 

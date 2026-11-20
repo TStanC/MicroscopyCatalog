@@ -3,7 +3,9 @@
 Read-only with respect to the data: files below ``labdata_root`` are only listed
 and opened for reading. The build works in the local working copy (.work) and then copies
 the result into the catalog folder (``catalog_dir``, settings.toml) - the only place it ever
-writes to on the share. At the start it pulls the catalog folder if that is newer.
+writes to on the share. It holds build.lock in the catalog folder for the whole run (one build
+at a time, on any machine), pulls the catalog folder if that is newer, processes the edit
+inbox (comments / values entered in the browser, mdcat.inbox) and publishes the result.
 
 Run (PowerShell, from the program folder):
     .venv\\Scripts\\python.exe build_catalog.py
@@ -30,7 +32,7 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from mdcat import TOOL_VERSION, lease, locks, safety, sync  # noqa: E402
+from mdcat import TOOL_VERSION, inbox, lease, locks, safety, sync  # noqa: E402
 from mdcat import comments as cm  # noqa: E402
 from mdcat import previews  # noqa: E402
 from mdcat.config import load_config  # noqa: E402
@@ -44,7 +46,7 @@ from mdcat.scan import abs_path, classify, walk  # noqa: E402
 EXIT_BUSY = 3
 EXIT_NOT_SET_UP = 2
 EXIT_OFFLINE = 4
-EXIT_NOT_OWNER = 5
+EXIT_SHARE_BUSY = 5   # another machine is building (build.lock) or an old server holds server.lock
 
 
 def main(argv=None) -> int:
@@ -57,9 +59,10 @@ def main(argv=None) -> int:
     ap.add_argument("--verify-readonly", action="store_true")
     ap.add_argument("--only", default=None)
     ap.add_argument("--no-publish", action="store_true")
-    ap.add_argument("--no-previews", action="store_true", help="do not create new preview images in this run")
+    ap.add_argument("--no-previews", action="store_true", help="no new preview images in this run (the default)")
     ap.add_argument("--preview-budget", type=float, default=None,
-                    help="minutes for new previews in this run (default: preview_budget_min)")
+                    help="also make new previews inside this run, for at most MIN minutes (default: none - "
+                         "make_previews.py makes them without holding build.lock)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.out)
@@ -74,30 +77,38 @@ def main(argv=None) -> int:
     # Test runs (--only / another --out) never pull or publish.
     is_test = bool(args.only) or os.path.normcase(cfg.out_dir) != os.path.normcase(cfg.data_dir)
     publish_dir = None if (args.no_publish or is_test) else cfg.publish_dir or None
-    if publish_dir:
-        try:
-            safety.configure_publish(publish_dir)
-            holder = lease.other_holder(publish_dir)
-        except (OSError, RuntimeError):
-            holder = None  # catalog folder offline: build locally, push later (see _run)
-        if holder:
-            print(f"The catalog folder {publish_dir} is maintained by the catalog server of "
-                  f"{lease.describe(holder)}; this machine must not write it. "
-                  f"Use --out <folder> for a separate test catalog.", file=sys.stderr)
-            return EXIT_NOT_OWNER
     safety.makedirs(cfg.cache_dir)
     safety.makedirs(os.path.join(cfg.out_dir, "logs"))
     lock = locks.build_lock(cfg)
     if not lock.acquire(timeout=0):
         print("Another catalog build is running (cache\\build.lock) - try again later.", file=sys.stderr)
         return EXIT_BUSY
+    share_lease = None
     try:
-        return _run(cfg, args, publish_dir)
+        if publish_dir:
+            try:
+                safety.configure_publish(publish_dir)
+                share_lease = lease.BuildLease(publish_dir)
+                holder = share_lease.acquire()
+            except (OSError, RuntimeError):
+                share_lease = holder = None  # catalog folder offline: build locally, push later (see _run)
+            if holder:
+                share_lease = None
+                if holder.get("legacy"):
+                    print(f"The catalog folder {publish_dir} is still maintained by an old catalog server "
+                          f"({lease.describe(holder)}); update the program there first.", file=sys.stderr)
+                else:
+                    print(f"A catalog build is running on another machine: {lease.describe(holder)} - "
+                          f"try again later.", file=sys.stderr)
+                return EXIT_SHARE_BUSY
+        return _run(cfg, args, publish_dir, share_lease)
     finally:
+        if share_lease:
+            share_lease.release()
         lock.release()
 
 
-def _run(cfg, args, publish_dir) -> int:
+def _run(cfg, args, publish_dir, share_lease) -> int:
     started = datetime.now()
     run_ts = started.isoformat(timespec="seconds")
     log_path = os.path.join(cfg.out_dir, "logs", f"run_{started:%Y%m%d_%H%M%S}.log")
@@ -112,18 +123,37 @@ def _run(cfg, args, publish_dir) -> int:
     log(f"Working directory {cfg.out_dir} (config {cfg.config_path})")
     p_over = os.path.join(cfg.out_dir, "manual_overrides.csv")
     p_needs = os.path.join(cfg.out_dir, "needs_input.csv")
-    share_ok = bool(publish_dir)
-    if publish_dir:
+    share_ok = bool(publish_dir and share_lease)  # never publish without holding build.lock
+    if publish_dir and not share_lease:
+        log(f"WARNING: catalog folder {publish_dir} not reachable - working on the local copy; "
+            f"the changes are copied there by a later build")
+    if share_ok:
         # the catalog folder is the master copy: take it if it is newer (other machine, new install)
         try:
             with locks.edit_lock(cfg):
                 sync.pull_if_newer(cfg, log)
+                sync.pull_previews(cfg, log)
         except (OSError, RuntimeError) as exc:
             share_ok = False
             log(f"WARNING: catalog folder {publish_dir} not reachable ({exc}) - working on the local copy; "
                 f"the changes are copied there by a later build")
     db = sqlite3.connect(safety.check_writable(cfg.db_path), timeout=30)
     cm.ensure_table(db)
+    inbox.ensure_table(db)
+
+    # edits from the browser (any machine), oldest first; archived only after a successful publish
+    inbox_results = []
+    if share_ok:
+        try:
+            entries = inbox.pending(publish_dir)
+        except OSError as exc:
+            entries = []
+            log(f"WARNING: cannot read the edit inbox ({exc}) - processed by a later build")
+        if entries:
+            log(f"Processing {len(entries)} edit(s) from the inbox")
+            with locks.edit_lock(cfg):
+                inbox_results = inbox.apply(db, p_over, entries, os.path.join(cfg.out_dir, "logs", "web_edits.log"),
+                                            log)
 
     with locks.edit_lock(cfg):
         ov.ensure_overrides_file(p_over)
@@ -168,11 +198,12 @@ def _run(cfg, args, publish_dir) -> int:
             log(f"{added} value(s) entered; rebuilding catalog")
             data = build_and_write(prev_acq, prev_img)
 
-    budget = 0 if (args.no_previews or args.only) else \
-        (args.preview_budget if args.preview_budget is not None else
-         (cfg.preview_budget_min if cfg.previews_on else 0)) * 60
+    # new previews normally come from make_previews.py (own lock): a build holds build.lock, and a
+    # long preview run inside it would block everyone's edits
+    budget = 0 if (args.no_previews or args.only or args.preview_budget is None) else args.preview_budget * 60
     pstats = previews.update(cfg, data, scan.files, log, budget)
     log(f"Previews: {pstats}")
+    keep = None
     if not args.only:  # drop previews of files that changed or disappeared
         keep = {it["key"] + ".jpg" for it in previews.plan(data, scan.files)}
         for f in os.listdir(previews.previews_dir(cfg)):
@@ -227,10 +258,19 @@ def _run(cfg, args, publish_dir) -> int:
         try:
             if not share_ok:
                 raise RuntimeError("not reachable at the start of this build")
-            publish(cfg, db, log)
+            publish(cfg, db, log, share_lease, keep)
         except (OSError, RuntimeError) as exc:  # share offline: the local catalog is complete, push later
             sync.mark_pending(cfg)
             log(f"  WARNING: could not copy the catalog to {cfg.publish_dir}: {exc}")
+        else:
+            if inbox_results:
+                inbox.archive(publish_dir, inbox_results, log)
+            try:
+                n = inbox.prune(publish_dir)
+                if n:
+                    log(f"  removed {n} processed inbox file(s) older than {inbox.KEEP_DAYS} days")
+            except OSError:
+                pass
     db.close()
 
     present = [a for a in data["acquisitions"] if a.get("present")]
@@ -256,24 +296,24 @@ comments.csv          full comment log (also in catalog.sqlite)
 manual_overrides.csv  manually entered values
 previews/             small preview images (overview, max projection, cutout per channel)
 metadata/             cached raw metadata (OME-XML) of the image files
-logs/web_edits.log    who edited what
+logs/web_edits.log    who edited what (and whether it was applied)
+inbox/                edits from the browser waiting for the next catalog update;
+                      processed ones in inbox/done, inbox/conflicts, inbox/failed
 sync.json             version of this folder's content
-server.lock           which catalog server currently maintains this folder ({owner})
+build.lock            present while a catalog update runs (which machine)
 
 To add comments or missing values, run the catalog server (git repository
 "microscopy-catalog", see its INSTALL.md) on your machine and open http://localhost:{port}.
-Only one server at a time maintains this folder; others show it read-only.
+Any number of servers can use this folder at the same time; edits are queued in inbox/.
 """
 
 
-def publish(cfg, db, log) -> None:
+def publish(cfg, db, log, share_lease, preview_keep: set[str] | None = None) -> None:
     """Copy the catalog into the catalog folder (whitelisted names, atomic writes) and bump its
     generation in sync.json (written last, so an interrupted publish is simply repeated)."""
     pdir = cfg.publish_dir
     sync.check_not_behind(cfg)
-    holder = lease.other_holder(pdir)
-    if holder:
-        raise RuntimeError(f"catalog folder is maintained by {lease.describe(holder)}")
+    share_lease.check()
     out = cfg.out_dir
     for name in ("catalog.html", "catalog_datasets.csv", "catalog_images.csv", "catalog_scenes.csv",
                  "catalog_files.csv", "catalog.json", "CATALOG.md", "CHANGELOG.md", "comments.csv",
@@ -295,12 +335,12 @@ def publish(cfg, db, log) -> None:
     if os.path.exists(audit):
         with open(audit, "rb") as fh:
             safety.publish_file(pdir, "logs/web_edits.log", fh.read())
-    n_prev = sync.push_dir(pdir, "previews", previews.previews_dir(cfg), "previews/", remove_stale=True)
+    n_prev = sync.push_dir(pdir, "previews", previews.previews_dir(cfg), "previews/", remove_stale=True,
+                           keep=preview_keep)
     n_meta = sum(sync.push_dir(pdir, f"metadata/{k}", os.path.join(cfg.cache_dir, k), f"metadata/{k}/",
                                remove_stale=False) for k in ("xml", "orig"))
-    owner = lease.read(pdir)
-    safety.publish_file(pdir, "README.txt", PUBLISH_README.format(
-        port=cfg.server_port, owner=lease.describe(owner) if owner else "none").encode("utf-8"))
+    safety.publish_file(pdir, "README.txt", PUBLISH_README.format(port=cfg.server_port).encode("utf-8"))
+    share_lease.check()
     gen = sync.commit_push(cfg)
     log(f"Copied catalog -> {pdir} (generation {gen}; {n_prev} new preview(s), {n_meta} metadata file(s))")
 

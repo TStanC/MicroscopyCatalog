@@ -53,9 +53,9 @@ class Config:
     segmentation_patterns: list[str] = field(default_factory=list)
     sceneviewer: str = ""
     server_port: int = 8766
-    auto_update_min: float = 60
+    auto_update_min: float = 1440
     previews: str = "network"
-    preview_budget_min: float = 20
+    preview_budget_min: float = 1380
     config_path: str = ""
 
     # the build code calls the catalog folder the "publish" folder

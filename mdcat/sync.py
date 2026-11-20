@@ -8,11 +8,13 @@ folder (build_catalog.publish). ``sync.json`` in both places carries a generatio
   -> pull: database, manual values, page, previews, raw-metadata cache, edit log.
 * local copy has changes that could not be pushed (share offline) -> pushed with the next
   build; if the catalog folder moved on in the meantime, the local copy is backed up to
-  .work/backup first and then replaced (nothing is lost, but it is not merged).
+  .work/backup first and then replaced. Edits from the browser are not affected: they stay
+  in the inbox of the catalog folder until a published build has applied them.
 """
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import shutil
@@ -62,7 +64,7 @@ def check_not_behind(cfg) -> None:
 def commit_push(cfg) -> int:
     """After a complete publish: bump the generation in the catalog folder and locally."""
     gen = max(int(share_state(cfg).get("generation", 0)), int(local_state(cfg).get("generation", 0))) + 1
-    rec = {"generation": gen, "host": socket.gethostname().lower(),
+    rec = {"generation": gen, "host": socket.gethostname().lower(), "user": getpass.getuser().lower(),
            "time": datetime.now().isoformat(timespec="seconds")}
     safety.publish_file(cfg.publish_dir, STATE, json.dumps(rec, indent=1).encode("utf-8"))
     _save_local(cfg, {"generation": gen, "pending_push": False, "pushed": rec["time"]})
@@ -119,23 +121,46 @@ def pull_if_newer(cfg, log) -> bool:
     return True
 
 
-def push_dir(pdir: str, sub: str, local: str, pattern_prefix: str, remove_stale: bool) -> int:
-    """Copy new/changed files of ``local`` into <pdir>/<sub> (one listing per side)."""
+def pull_previews(cfg, log) -> int:
+    """Copy previews that are in the catalog folder but not in the working copy (made on another
+    machine by make_previews.py, which copies them there one by one). Every build does this, so it
+    links them into the page and never treats them as missing."""
+    from . import previews  # noqa: PLC0415 - avoid an import cycle at module load
+    sdir, local = os.path.join(cfg.publish_dir, "previews"), previews.previews_dir(cfg)
+    if not os.path.isdir(sdir):
+        return 0
+    safety.makedirs(local)
+    have = set(os.listdir(local))
+    n = 0
+    for e in os.scandir(sdir):
+        if e.is_file() and e.name.endswith(".jpg") and e.name not in have:
+            _copy_in(e.path, os.path.join(local, e.name))
+            n += 1
+    if n:
+        log(f"  took {n} preview(s) made on other machines from the catalog folder")
+    return n
+
+
+def push_dir(pdir: str, sub: str, local: str, pattern_prefix: str, remove_stale: bool,
+             keep: set[str] | None = None) -> int:
+    """Copy new/changed files of ``local`` into <pdir>/<sub> (one listing per side). With
+    ``remove_stale``, files there that are not in ``local`` are removed - unless named in ``keep``
+    (e.g. previews another machine copied there while this build ran)."""
     if not os.path.isdir(local):
         return 0
     sdir = os.path.join(pdir, *sub.split("/"))
     remote = {e.name: e.stat().st_size for e in os.scandir(sdir) if e.is_file()} if os.path.isdir(sdir) else {}
-    n, keep = 0, set()
+    n, local_names = 0, set()
     for e in os.scandir(local):
         if not e.is_file() or e.name.endswith(".tmp"):
             continue
-        keep.add(e.name)
+        local_names.add(e.name)
         if remote.get(e.name) != e.stat().st_size:
             with open(e.path, "rb") as fh:
                 safety.publish_file(pdir, f"{pattern_prefix}{e.name}", fh.read())
             n += 1
     if remove_stale:
         for name in remote:
-            if name not in keep and not name.endswith(".tmp"):
+            if name not in local_names and name not in (keep or ()) and not name.endswith(".tmp"):
                 safety.unpublish_file(pdir, f"{pattern_prefix}{name}")
     return n

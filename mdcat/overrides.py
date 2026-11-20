@@ -128,6 +128,24 @@ FIELD_HINTS = {
 }
 
 
+def norm_key(field: str, image_key: str) -> str:
+    """Image key as stored: image fields default to "*" (all images), dataset fields have none."""
+    if field not in IMAGE_FIELDS:
+        return ""
+    return (image_key or "").strip() or "*"
+
+
+def _same_key(r: dict, acq_id: str, image_key: str, field: str) -> bool:
+    return (r.get("acq_id") == acq_id and r.get("field") == field
+            and norm_key(field, r.get("image_key", "")) == norm_key(field, image_key))
+
+
+def current_value(path: str, acq_id: str, image_key: str, field: str) -> dict | None:
+    """The manual value row stored for this key (last one wins, like load_overrides), else None."""
+    rows = [r for r in _read_csv(path) if _same_key(r, acq_id, image_key, field)]
+    return rows[-1] if rows else None
+
+
 def set_override(path: str, acq_id: str, image_key: str, field: str, value: str, note: str) -> str:
     """Insert/replace one manual value (``value`` empty -> remove it). Returns 'set' or 'removed'.
 
@@ -135,15 +153,12 @@ def set_override(path: str, acq_id: str, image_key: str, field: str, value: str,
     """
     if field not in ALL_FIELDS:
         raise ValueError(f"unknown field {field!r}")
-    image_key = (image_key or "").strip() if field in IMAGE_FIELDS else ""
-    if field in IMAGE_FIELDS and not image_key:
-        image_key = "*"
+    image_key = norm_key(field, image_key)
     value = (value or "").strip()
     if value:
         parse_value(field, value)  # raises ValueError with a helpful message
     rows = _read_csv(path)
-    key = (acq_id, image_key, field)
-    same = lambda r: (r["acq_id"], r.get("image_key", ""), r["field"]) == key  # noqa: E731
+    same = lambda r: _same_key(r, acq_id, image_key, field)  # noqa: E731
     if field == "link_attachment":  # several links per dataset are allowed
         same = lambda r: (r["acq_id"], r["field"], r.get("value", "")) == (acq_id, field, value)  # noqa: E731
     rows = [r for r in rows if not same(r)]
@@ -155,8 +170,8 @@ def set_override(path: str, acq_id: str, image_key: str, field: str, value: str,
 
 def remove_override(path: str, acq_id: str, image_key: str, field: str, value: str = "") -> bool:
     rows = _read_csv(path)
-    keep = [r for r in rows if not (r["acq_id"] == acq_id and r.get("image_key", "") == (image_key or "")
-                                    and r["field"] == field and (not value or r.get("value", "") == value))]
+    keep = [r for r in rows if not (_same_key(r, acq_id, image_key, field)
+                                    and (not value or r.get("value", "") == value))]
     if len(keep) == len(rows):
         return False
     _write_csv(path, OVERRIDE_COLUMNS, keep)

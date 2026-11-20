@@ -460,12 +460,16 @@ function scenesHtml(r){const ns=r.scenes.length,all=!!scAll[r.acq_id],isOpen=scO
 
 // ------------------------------------------------------------ editing (only via serve_catalog.py)
 const SRV=window.MDCAT_SERVER||null;let CAN_EDIT=!!(SRV&&SRV.can_edit);
-function setMode(){const st=SRV?SRV.status:'';
+// edits go into the inbox of the catalog folder and are applied by the next catalog update (any machine);
+// until then they are shown as "pending" (from /api/pending), conflicts / failed ones in a box per dataset
+let PEND={pending:[],conflicts:[],failed:[]};const PAGE_GEN=SRV?(SRV.page_generation||0):0;let updNote=false;
+function setMode(){const np=PEND.pending.length;
  $('mode').innerHTML=SRV?((CAN_EDIT?'<b style="color:var(--ok)">editing enabled</b> as '+esc(SRV.user)
-   :'<b style="color:var(--warn)">view only</b>'+(st!=='ok'?' – '+esc(SRV.status_msg):(SRV.user&&SRV.user!==SRV.owner?' ('+esc(SRV.user)+' is not the server owner '+esc(SRV.owner)+')':'')))
+   :'<b style="color:var(--warn)">view only</b> – '+esc(SRV.status_msg))
+   +(np?' · <span style="color:var(--warn)">'+np+' edit'+(np>1?'s':'')+' waiting for the next catalog update</span>':'')
    +' · <a href="/setup">⚙ Settings</a>')
  :'static copy – to add comments or values, run the catalog server on your machine (see README.txt next to this page)'}
-function toast(msg,err){const t=$('toast');t.innerHTML=msg;t.className='toast'+(err?' err':'');t.style.display='block';if(!err&&!/updating/.test(msg))setTimeout(()=>t.style.display='none',4000)}
+function toast(msg,err){const t=$('toast');t.innerHTML=msg;t.className='toast'+(err?' err':'');t.style.display='block';if(!err)setTimeout(()=>t.style.display='none',6000)}
 async function api(path,body){const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-MDCAT':'1'},body:JSON.stringify(body)});
  let j={};try{j=await res.json()}catch(e){}if(!res.ok||!j.ok)throw new Error(j.error||('HTTP '+res.status));return j}
 function saveUi(){try{sessionStorage.setItem('mdcat_ui',JSON.stringify({open:[...open],q:$('q').value,inst:$('inst').value,stat:$('stat').value,cat:$('cat').value,own:$('own').value,
@@ -473,24 +477,62 @@ function saveUi(){try{sessionStorage.setItem('mdcat_ui',JSON.stringify({open:[..
 function restoreUi(){let s=null;try{s=JSON.parse(sessionStorage.getItem('mdcat_ui')||'null');sessionStorage.removeItem('mdcat_ui')}catch(e){}if(!s)return;
  s.open.forEach(x=>open.add(x));$('q').value=s.q;['inst','stat','cat','own'].forEach(i=>$(i).value=s[i]);s.cb.forEach(i=>$(i).checked=true);
  sortKey=s.sortKey;sortDir=s.sortDir;Object.assign(subSort,s.subSort);Object.assign(scOpen,s.scOpen);Object.assign(scAll,s.scAll);render();setTimeout(()=>window.scrollTo(0,s.y),0)}
-async function waitAndReload(gen){toast('Saved. Updating catalog …');for(let i=0;i<600;i++){await new Promise(r=>setTimeout(r,1500));
-  try{const s=await (await fetch('/api/state')).json();if(s.generation>gen&&!s.build.running&&!s.build.pending){if(s.build.last_ok===false){toast('Saved, but the catalog update failed: '+esc(s.build.last_error||''),true);return}saveUi();location.reload();return}}catch(e){}}
- toast('Saved – the catalog update takes long; reload the page later.',true)}
-async function doEdit(path,body){try{const j=await api(path,body);await waitAndReload(j.generation)}catch(e){toast('Not saved: '+esc(e.message),true)}}
-function commentsHtml(r){const cs=r.comments||[];if(!cs.length&&!CAN_EDIT)return'';let h='<div class="box"><b>Comments</b>';
- for(const c of cs)h+='<div class="cm">'+esc(c.text)+'<div class="src">'+esc(c.user)+' · '+esc((c.ts||'').replace('T',' '))+(c.image_key?' · image '+esc(c.image_key):'')
-  +(CAN_EDIT?'<button class="x" title="delete comment" data-act="cdel" data-cid="'+esc(c.comment_id)+'">×</button>':'')+'</div></div>';
+function typing(){return[...document.querySelectorAll('#tb textarea,#tb input.v')].some(x=>x.value.trim())}
+async function loadPending(){if(!SRV)return;try{const j=await (await fetch('/api/pending')).json();
+ PEND={pending:j.pending||[],conflicts:j.conflicts||[],failed:j.failed||[]};setMode();if(!typing())render()}catch(e){}}
+async function poll(){try{const s=await (await fetch('/api/state')).json();
+  if(s.catalog_generation>PAGE_GEN){if(!typing()){saveUi();location.reload();return}
+   if(!updNote){updNote=true;toast('The catalog was updated – reload the page to see the changes.')}}}catch(e){}
+ await loadPending()}
+async function doEdit(path,body){try{const j=await api(path,body);if(j.entry)PEND.pending.push(j.entry);setMode();render();
+  toast('Saved – shown as <i>pending</i> until the next catalog update applies it (usually within a few minutes).')}
+ catch(e){toast('Not saved: '+esc(e.message),true)}}
+const pendOf=acq=>PEND.pending.filter(e=>e.acq_id===acq);
+const nik=(f,ik)=>D.image_fields.includes(f)?((ik||'').trim()||'*'):'';
+function effComments(r){const cs=(r.comments||[]).map(c=>({...c}));
+ for(const e of pendOf(r.acq_id)){
+  if(e.action==='comment_add'&&!cs.some(c=>c.comment_id===e.id))cs.push({comment_id:e.id,ts:(e.ts||'').slice(0,19),user:e.user,image_key:e.image_key||'',text:e.text,pending:'add'});
+  else if(e.action==='comment_delete'){const c=cs.find(c=>c.comment_id===e.comment_id);if(c)c.pending='del'}}
+ return cs}
+function effOverrides(r){const os=(r.overrides||[]).map(o=>({...o}));
+ for(const e of pendOf(r.acq_id)){if(e.action!=='value_set'&&e.action!=='value_remove')continue;
+  if(e.field==='link_attachment'){if(e.action==='value_set')os.push({image_key:'',field:e.field,value:e.value,note:'by '+e.user,pending:'set'});
+   else{const o=os.find(o=>o.field===e.field&&o.value===e.old_value&&o.pending!=='del');if(o)o.pending='del'}continue}
+  const ik=nik(e.field,e.image_key),i=os.findIndex(o=>o.field===e.field&&nik(o.field,o.image_key)===ik&&o.pending!=='del');
+  if(e.action==='value_set'){const n={image_key:ik,field:e.field,value:e.value,note:'by '+e.user,pending:'set'};if(i>=0)os[i]=n;else os.push(n)}
+  else if(i>=0)os[i].pending='del'}
+ return os}
+// the value the user sees now: sent as old_value, the update applies the edit only if it is still the stored one
+function curVal(r,f,ik){const o=effOverrides(r).find(o=>o.field===f&&nik(o.field,o.image_key)===nik(f,ik)&&o.pending!=='del');return o?o.value:''}
+function describeEdit(e){const u=(e.user||'?')+' ('+(e.ts||'').slice(0,16).replace('T',' ')+')',img=e.image_key&&e.image_key!=='*'?' (image '+e.image_key+')':'';
+ if(e.action==='value_set')return u+': set '+e.field+img+' = '+e.value;
+ if(e.action==='value_remove')return u+': remove '+e.field+img+' = '+e.old_value;
+ if(e.action==='comment_add')return u+': comment “'+(e.text||'').slice(0,300)+'”';
+ return u+': delete a comment'}
+function notAppliedHtml(r){const xs=[...PEND.conflicts,...PEND.failed].filter(e=>e.acq_id===r.acq_id);if(!xs.length)return'';
+ let h='<div class="box"><b style="color:var(--warn)">Edits not applied</b>';
+ for(const e of xs)h+='<div class="cm" style="border-left-color:var(--warn)">'+esc(describeEdit(e))+'<div class="src">'+esc(e.outcome==='conflict'?'conflict':'failed')+': '+esc(e.reason||'')+' · '+esc((e.processed||'').replace('T',' '))+'</div></div>';
+ return h+'<div class="src">The value had been changed by someone else in the meantime (or the edit was invalid). Check the current value and enter it again if needed. Shown for 14 days.</div></div>'}
+function commentsHtml(r){const cs=effComments(r);if(!cs.length&&!CAN_EDIT)return'';let h='<div class="box"><b>Comments</b>';
+ for(const c of cs)h+='<div class="cm"'+(c.pending?' style="opacity:.75"':'')+'>'+(c.pending==='del'?'<s>'+esc(c.text)+'</s>':esc(c.text))+'<div class="src">'+esc(c.user)+' · '+esc((c.ts||'').replace('T',' '))+(c.image_key?' · image '+esc(c.image_key):'')
+  +(c.pending?' · <span style="color:var(--warn)">'+(c.pending==='del'?'deletion pending':'pending')+'</span>':'')
+  +(CAN_EDIT&&c.pending!=='del'?'<button class="x" title="delete comment" data-act="cdel" data-acq="'+esc(r.acq_id)+'" data-cid="'+esc(c.comment_id)+'">×</button>':'')+'</div></div>';
  if(!cs.length)h+='<div class="muted">No comments yet.</div>';
  if(CAN_EDIT){const imgs=r.images.filter(i=>i.image_key!=='*');h+='<div style="margin-top:6px"><textarea id="ct_'+r.acq_id+'" placeholder="Add a comment (what is in this dataset, problems, where results are, …)"></textarea>'
   +(imgs.length>1?'<label class="muted">about image <select id="ci_'+r.acq_id+'"><option value="">whole dataset</option>'+imgs.map(i=>'<option>'+esc(i.image_key)+'</option>').join('')+'</select></label> ':'')
   +'<button data-act="cadd" data-acq="'+esc(r.acq_id)+'">Add comment</button></div>'}
  return h+'</div>'}
-function valuesHtml(r){const ns=r.needs||[],os=r.overrides||[];if(!CAN_EDIT&&!os.length)return'';let h='<div class="box"><b>Manual values</b>';
+function valuesHtml(r){const pv=pendOf(r.acq_id).filter(e=>e.action==='value_set');
+ const ns=(r.needs||[]).filter(n=>!pv.some(e=>e.field===n.field&&nik(e.field,e.image_key)===nik(n.field,n.image_key))),os=effOverrides(r);
+ if(!CAN_EDIT&&!os.length)return'';let h='<div class="box"><b>Manual values</b>';
  if(CAN_EDIT&&ns.length){h+='<div style="color:var(--warn);margin:4px 0">Missing values – enter what you know:</div><table class="sub">';
-  ns.forEach((n,k)=>{h+='<tr><td>'+esc(n.field)+'</td><td>'+(n.image_key==='*'?'all images':esc(n.image_key))+'</td><td><input class="v" id="nv_'+r.acq_id+'_'+k+'" placeholder="'+esc(n.hint)+'"></td><td><button data-act="need" data-acq="'+esc(r.acq_id)+'" data-k="'+k+'">Save</button></td></tr>'});h+='</table>'}
+  ns.forEach(n=>{const k=(r.needs||[]).indexOf(n);h+='<tr><td>'+esc(n.field)+'</td><td>'+(n.image_key==='*'?'all images':esc(n.image_key))+'</td><td><input class="v" id="nv_'+r.acq_id+'_'+k+'" placeholder="'+esc(n.hint)+'"></td><td><button data-act="need" data-acq="'+esc(r.acq_id)+'" data-k="'+k+'">Save</button></td></tr>'});h+='</table>'}
  if(os.length){h+='<table class="sub"><tr><th>Field</th><th>Image</th><th>Value</th><th>Note</th>'+(CAN_EDIT?'<th></th>':'')+'</tr>';
-  for(const o of os)h+='<tr><td>'+esc(o.field)+'</td><td>'+esc(o.image_key==='*'?'all images':o.image_key)+'</td><td>'+esc(o.value)+'</td><td class="muted">'+esc(o.note)+'</td>'
-   +(CAN_EDIT?'<td><button class="x" title="remove this value" data-act="odel" data-acq="'+esc(r.acq_id)+'" data-img="'+esc(o.image_key)+'" data-field="'+esc(o.field)+'" data-val="'+esc(o.value)+'">×</button></td>':'')+'</tr>';h+='</table>'}
+  for(const o of os){const v=o.pending==='del'?'<s>'+esc(o.value)+'</s>':esc(o.value);
+   h+='<tr'+(o.pending?' style="opacity:.75"':'')+'><td>'+esc(o.field)+'</td><td>'+esc(o.image_key==='*'?'all images':o.image_key)+'</td><td>'+v+'</td><td class="muted">'+esc(o.note)
+   +(o.pending?' <span style="color:var(--warn)">'+(o.pending==='del'?'removal pending':'pending')+'</span>':'')+'</td>'
+   +(CAN_EDIT?'<td>'+(o.pending!=='del'?'<button class="x" title="remove this value" data-act="odel" data-acq="'+esc(r.acq_id)+'" data-img="'+esc(o.image_key)+'" data-field="'+esc(o.field)+'" data-val="'+esc(o.value)+'">×</button>':'')+'</td>':'')+'</tr>'}
+  h+='</table>'}
  if(CAN_EDIT){const imgs=r.images.filter(i=>i.image_key!=='*');const fields=[...D.image_fields,...D.dataset_fields.filter(f=>f!=='link_attachment')];
   h+='<div style="margin-top:6px" class="muted">Set / correct a value: <select id="sf_'+r.acq_id+'">'+fields.map(f=>'<option>'+f+'</option>').join('')+'</select> '
    +'<select id="si_'+r.acq_id+'"><option value="*">all images</option>'+imgs.map(i=>'<option>'+esc(i.image_key)+'</option>').join('')+'</select> '
@@ -499,16 +541,16 @@ function valuesHtml(r){const ns=r.needs||[],os=r.overrides||[];if(!CAN_EDIT&&!os
  return h+'</div>'}
 $('tb').addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(!b)return;e.stopPropagation();const a=b.dataset.act,acq=b.dataset.acq,row=D.rows.find(r=>r.acq_id===acq);
  if(a==='cadd'){const txt=$('ct_'+acq).value.trim();if(!txt)return toast('Comment is empty',true);const s=$('ci_'+acq);doEdit('/api/comment',{acq_id:acq,image_key:s?s.value:'',text:txt})}
- else if(a==='cdel'){if(confirm('Delete this comment? (it stays in the history log)'))doEdit('/api/comment/delete',{comment_id:b.dataset.cid})}
- else if(a==='need'){const n=row.needs[+b.dataset.k],v=$('nv_'+acq+'_'+b.dataset.k).value.trim();if(!v)return toast('Enter a value first',true);doEdit('/api/value',{acq_id:acq,image_key:n.image_key,field:n.field,value:v})}
- else if(a==='oset'){const v=$('sv_'+acq).value.trim();if(!v)return toast('Enter a value first',true);doEdit('/api/value',{acq_id:acq,image_key:$('si_'+acq).value,field:$('sf_'+acq).value,value:v})}
+ else if(a==='cdel'){if(confirm('Delete this comment? (it stays in the history log)'))doEdit('/api/comment/delete',{acq_id:acq,comment_id:b.dataset.cid})}
+ else if(a==='need'){const n=row.needs[+b.dataset.k],v=$('nv_'+acq+'_'+b.dataset.k).value.trim();if(!v)return toast('Enter a value first',true);doEdit('/api/value',{acq_id:acq,image_key:n.image_key,field:n.field,value:v,old_value:curVal(row,n.field,n.image_key)})}
+ else if(a==='oset'){const v=$('sv_'+acq).value.trim(),f=$('sf_'+acq).value,ik=$('si_'+acq).value;if(!v)return toast('Enter a value first',true);doEdit('/api/value',{acq_id:acq,image_key:ik,field:f,value:v,old_value:curVal(row,f,ik)})}
  else if(a==='odel'){if(confirm('Remove this manual value?'))doEdit('/api/value',{acq_id:acq,image_key:b.dataset.img,field:b.dataset.field,value:'',old_value:b.dataset.val})}
  else if(a==='link'){const sel=$('lk_'+b.dataset.i);if(!sel.value)return toast('Choose a dataset',true);doEdit('/api/value',{acq_id:sel.value,image_key:'',field:'link_attachment',value:b.dataset.rel})}});
 function detail(r){const im=r.images;let h='';
  h+='<div class="mono">'+esc(r.acq_id)+' · '+esc(r.path)+'</div>';
  if(r.notes)h+='<div><b>Notes:</b> '+esc(r.notes)+'</div>';if(r.error)h+='<div style="color:var(--bad)"><b>Error:</b> '+esc(r.error)+'</div>';
  if(r.needs_input&&!CAN_EDIT)h+='<div style="color:var(--warn)"><b>Needs input:</b> '+esc(r.needs_input)+(SRV?'':' (enter it via the catalog server)')+'</div>';
- h+=commentsHtml(r)+valuesHtml(r);
+ h+=notAppliedHtml(r)+commentsHtml(r)+valuesHtml(r);
  if(im.length)h+=imagesHtml(r);
  if(r.scenes&&r.scenes.length)h+=scenesHtml(r);
  if(r.files.length){h+='<h4>Files ('+r.files.length+')</h4><table><tr><th>Role</th><th>Path (relative to root)</th><th>Size</th><th>Status</th></tr>';
@@ -541,6 +583,6 @@ document.addEventListener('click',e=>{const a=e.target.closest('a[data-lb]');
  if(a&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey&&e.button===0){e.preventDefault();e.stopPropagation();lbShow(lbLinks().indexOf(a));return}
  if(LB>=0&&e.target.closest('#lb')&&!e.target.closest('#lbcap a')){e.preventDefault();lbHide()}},true);
 document.addEventListener('keydown',e=>{if(LB<0)return;if(e.key==='Escape')lbHide();else if(e.key==='ArrowRight')lbShow(LB+1);else if(e.key==='ArrowLeft')lbShow(LB-1);else return;e.preventDefault()});
-setMode();renderUnas();stats();render();restoreUi();
+setMode();renderUnas();stats();render();restoreUi();if(SRV){loadPending();setInterval(poll,15000)}
 </script></body></html>
 """

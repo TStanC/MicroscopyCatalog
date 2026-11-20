@@ -50,15 +50,19 @@ PUBLISH_DIR_MARKER = ".mdcat-publish"   # marks a folder created by this tool
 PUBLISH_FILES = {
     "index.html", "catalog.sqlite", "catalog.json", "CATALOG.md", "CHANGELOG.md", "README.txt",
     "catalog_datasets.csv", "catalog_images.csv", "catalog_files.csv", "catalog_scenes.csv",
-    "comments.csv", "manual_overrides.csv", "sync.json", "server.lock", PUBLISH_DIR_MARKER,
+    "comments.csv", "manual_overrides.csv", "sync.json", "server.lock", "build.lock", "preview.lock",
+    PUBLISH_DIR_MARKER,
 }
+# edit inbox: inbox/<YYYYMMDDTHHMMSSmmm>_<user>_<id>.json, processed ones in done/conflicts/failed
+INBOX_PATTERN = re.compile(r"^inbox/(?:(?:done|conflicts|failed)/)?\d{8}T\d{9}_[A-Za-z0-9-]{1,40}_[0-9a-f]{8}\.json$")
 PUBLISH_PATTERNS = [
     re.compile(r"^previews/[0-9a-f]{16}\.jpg$"),
     re.compile(r"^metadata/xml/[0-9a-f]{16}\.ome\.xml\.gz$"),
     re.compile(r"^metadata/orig/[0-9a-f]{16}\.tsv\.gz$"),
     re.compile(r"^logs/web_edits\.log$"),
+    INBOX_PATTERN,
 ]
-REMOVABLE = [PUBLISH_PATTERNS[0], re.compile(r"^server\.lock$")]
+REMOVABLE = [PUBLISH_PATTERNS[0], re.compile(r"^(server|build|preview)\.lock$"), INBOX_PATTERN]
 
 
 def check_catalog_dir(catalog_dir: str, labdata_root: str) -> str:
@@ -111,8 +115,22 @@ def _check_publish_name(publish_dir: str, name: str) -> None:
         raise PermissionError(f"Refusing to write an unexpected file name into the catalog folder: {name}")
 
 
+def create_exclusive(publish_dir: str, name: str, data: bytes) -> bool:
+    """Create a whitelisted file in the catalog folder only if it does not exist yet (atomic on
+    SMB: the file server decides). Returns False if it already exists."""
+    _check_publish_name(publish_dir, name)
+    path = os.path.join(publish_dir, *name.split("/"))
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return True
+
+
 def unpublish_file(publish_dir: str, name: str) -> None:
-    """Remove one file from the catalog folder (only preview images and server.lock)."""
+    """Remove one file from the catalog folder (only preview images, lock files and inbox entries)."""
     _check_publish_name(publish_dir, name)
     if not any(p.match(name) for p in REMOVABLE):
         raise PermissionError(f"Refusing to remove {name}")

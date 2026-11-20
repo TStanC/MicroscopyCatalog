@@ -8,16 +8,18 @@
 labdata_root = ''
 # Catalog folder: database (incl. comments), manual values, previews, raw-metadata cache and the
 # published page (index.html). Inside labdata_root it must be a folder directly in it (the scan
-# skips it). The server works on a local copy (work_dir) and copies every change here within
-# seconds; only one server at a time may write (server.lock in this folder).
+# skips it). Shared by any number of servers: edits are queued in inbox/ here, and one build at a
+# time (build.lock in this folder) applies them and publishes from its local copy (work_dir).
 catalog_dir = ''
-# Incremental update every N minutes (0 = only after edits / on demand).
-auto_update_min = 60
+# Incremental update (Labdata scan) every N minutes; 1440 = once a day (0 = only after edits /
+# on demand). Edits are applied right away regardless of this setting.
+auto_update_min = 1440
 # Preview images: "network" (read at most ~300 MB per image - fine over VPN), "full" (up to
 # ~3 GB per image, for huge stacks on a fast connection) or "off".
 previews = "network"
-# Minutes per run spent on new preview images (the rest follows in the next run).
-preview_budget_min = 20
+# Maximum minutes one preview run may take (1380 = 23 h). A run makes all missing previews and
+# stops early when done; only what is left after this time follows in the next run.
+preview_budget_min = 1380
 
 # --- advanced ----------------------------------------------------------------------------------
 # Java (JDK bin folder) + folder with the Bio-Formats jar: set by install.ps1 in

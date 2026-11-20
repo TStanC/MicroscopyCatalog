@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 COLORS = {"ok": (31, 138, 76), "starting": (120, 128, 140), "setup": (47, 111, 219),
           "offline": (183, 121, 31), "readonly": (183, 121, 31)}
 LABEL = {"ok": "running", "starting": "starting", "setup": "not set up yet - open Settings",
-         "offline": "offline (Labdata / catalog folder not reachable)", "readonly": "read-only (another server maintains the catalog)"}
+         "offline": "offline (Labdata / catalog folder not reachable)", "readonly": "read-only (an older catalog server maintains the catalog folder)"}
 
 
 def make_icon(status: str, busy: bool = False) -> Image.Image:

@@ -95,13 +95,46 @@ def plan_from_db(cfg, db) -> list[dict]:
     return plan({"acquisitions": list(acq.values()), "scenes": scenes}, files)
 
 
-def make(cfg, items: list[dict], log, budget_s: float) -> dict:
-    """Create the missing previews of ``items`` (newest datasets first) within the time budget."""
+def _share_previews(share_dir: str | None) -> set[str]:
+    if not share_dir:
+        return set()
+    return {f[:-4] for f in os.listdir(os.path.join(share_dir, "previews")) if f.endswith(".jpg")} \
+        if os.path.isdir(os.path.join(share_dir, "previews")) else set()
+
+
+def make(cfg, items: list[dict], log, budget_s: float, share_dir: str | None = None) -> dict:
+    """Create the missing previews of ``items`` (newest datasets first) within the time budget.
+
+    With ``share_dir`` (the catalog folder, configured for publishing): previews another machine
+    already put there are copied instead of rendered ("fetched"), and every new preview is copied
+    there right away - so other machines never render it again and the next build on any machine
+    links it into the page."""
     pdir = previews_dir(cfg)
     safety.makedirs(pdir)
     have = {f[:-4] for f in os.listdir(pdir) if f.endswith(".jpg")}
     todo = [it for it in items if it["key"] not in have]
-    stats = {"images": len(items), "existing": len(items) - len(todo), "made": 0, "failed": 0, "deferred": 0}
+    stats = {"images": len(items), "existing": len(items) - len(todo), "made": 0, "fetched": 0, "failed": 0,
+             "deferred": 0}
+
+    def fetch(keys: set[str]) -> None:
+        nonlocal todo
+        for it in todo:
+            if it["key"] in keys and it["key"] not in have:
+                try:
+                    with open(os.path.join(share_dir, "previews", it["key"] + ".jpg"), "rb") as fh:
+                        safety.replace_local(os.path.join(pdir, it["key"] + ".jpg"), fh.read())
+                    have.add(it["key"])
+                    stats["fetched"] += 1
+                except OSError:
+                    pass
+        todo = [it for it in todo if it["key"] not in have]
+
+    if todo and share_dir:
+        try:
+            fetch(_share_previews(share_dir))
+        except OSError as exc:
+            log(f"Previews: catalog folder not reachable ({exc}) - new previews are copied there by a later build")
+            share_dir = None
     if todo and budget_s > 0:
         tmp = os.path.join(cfg.cache_dir, "thumbs")
         safety.makedirs(tmp)
@@ -115,7 +148,14 @@ def make(cfg, items: list[dict], log, budget_s: float) -> dict:
             if time.time() - t0 > budget_s:
                 stats["deferred"] += sum(len(by_file[r]) for r in files_order[n:])
                 break
-            its = by_file[rel]
+            its = [it for it in by_file[rel] if it["key"] not in have]
+            if share_dir and its:  # made on another machine since this run started?
+                for it in its:
+                    if os.path.exists(os.path.join(share_dir, "previews", it["key"] + ".jpg")):
+                        fetch({it["key"]})
+                its = [it for it in its if it["key"] not in have]
+            if not its:
+                continue
             prefix = os.path.join(tmp, hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16])
             series = sorted({it["series"] for it in its})
             res = run_jobs(cfg, [Job("thumb", abs_path(cfg, rel), prefix, ",".join(map(str, series)))], log,
@@ -125,9 +165,17 @@ def make(cfg, items: list[dict], log, budget_s: float) -> dict:
                 try:
                     if not res.ok:
                         raise RuntimeError(res.message)
-                    compose(base, os.path.join(pdir, it["key"] + ".jpg"), it["title"])
+                    out = os.path.join(pdir, it["key"] + ".jpg")
+                    compose(base, out, it["title"])
                     stats["made"] += 1
                     have.add(it["key"])
+                    if share_dir:
+                        try:
+                            with open(out, "rb") as fh:
+                                safety.publish_file(share_dir, f"previews/{it['key']}.jpg", fh.read())
+                        except OSError as exc:
+                            log(f"    cannot copy previews to the catalog folder ({exc}) - a later build does it")
+                            share_dir = None
                 except Exception as exc:  # noqa: BLE001 - one bad image must not stop the run
                     stats["failed"] += 1
                     log(f"    preview failed for {rel} series {it['series']}: {str(exc)[:200]}")

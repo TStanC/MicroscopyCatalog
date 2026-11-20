@@ -12,15 +12,25 @@ Installation: see [INSTALL.md](INSTALL.md).
 | Settings of this machine | `settings.toml` in the program folder (written by the setup page) |
 | **Catalog folder** - the master copy: database (incl. comments), manual values, previews, raw-metadata cache, edit log, published page | chosen on the setup page, e.g. `X:\Titus\Labdata\MicroscopyCatalog\` |
 | Catalog for everybody (read-only) | `<catalog folder>\index.html` |
-| Catalog with editing | `http://localhost:8766` on the machine running the server |
+| Catalog with editing | `http://localhost:8766` on any machine running the server |
 | Local working copy + logs | `.work\` in the program folder |
 
-SQLite must not be written live over a network share (a dropped connection can corrupt it), so
-the server works on the local copy in `.work\` and copies every change into the catalog folder
-within seconds (each build pushes a consistent snapshot; `sync.json` there carries a generation
-number). When the catalog folder is newer than the local copy (another machine published, fresh
-install), the next build pulls it first. If the catalog folder is not reachable, the server shows
-the local copy read-only and retries every minute.
+Any number of servers (machines, users) can use the same catalog folder at the same time:
+
+* **Edits** (comments, values) are written at once into `inbox\` in the catalog folder, one small
+  file per edit (`<time>_<user>_<id>.json`) - no lock needed, names never collide. The page shows
+  them as *pending* until they are applied.
+* **Builds** apply the inbox, scan Labdata and publish the catalog. Only one build at a time runs
+  across all machines: it holds `build.lock` in the catalog folder while it runs (heartbeat every
+  minute; a lock without a heartbeat for 10 minutes is taken over). A server whose build finds the
+  lock taken retries every minute while edits are waiting.
+* SQLite must not be written live over a network share (a dropped connection can corrupt it), so
+  a build works on the local copy in `.work\` and copies a consistent snapshot into the catalog
+  folder (`sync.json` there carries a generation number). When the catalog folder is newer than
+  the local copy (another machine published, fresh install), the build pulls it first.
+
+If the catalog folder is not reachable, the server shows the local copy read-only and retries
+every minute.
 
 ## Server
 
@@ -28,17 +38,27 @@ Started by the autostart shortcut or the **Microscopy Catalog** Start-menu short
 (`.venv\Scripts\pythonw.exe serve_catalog.py`, no console window). It
 * shows an icon in the notification area: left click opens the catalog; right click gives Open
   catalog, Update now, Settings, Stop; the colour shows the status (`mdcat/tray.py`);
-* serves the catalog on `http://localhost:8766` (this machine only). Only the Windows user who
-  runs the server can edit; other users of the machine (e.g. via RDP) see it read-only;
+* serves the catalog on `http://localhost:8766` (this machine only). Every Windows user of the
+  machine (also via RDP) can comment and enter values under their own name - the server finds
+  out who opened the connection (`mdcat/winuser.py`). Only the user who runs the server can
+  change its settings;
 * shows the setup page (`/setup`, **⚙ Settings** in the page header) on first start;
-* after an edit rebuilds the catalog (a few seconds; previews skipped) and the page reloads;
-* runs an incremental update every `auto_update_min` (60) minutes and makes new previews in a
-  separate process;
-* holds `server.lock` in the catalog folder (heartbeat every 2 min). A second server (another
-  machine/user) stays read-only and takes over when the lock is older than 10 minutes. Builds
-  started by hand on another machine refuse to write (exit code 5);
-* logs to `.work\logs\server.log`; every edit is also recorded in `logs\web_edits.log` (copied to
-  the catalog folder).
+* after an edit starts a build (a few seconds plus the Labdata scan; previews skipped); the page
+  reloads by itself once a newer catalog is published (unless you are typing);
+* checks every 5 minutes whether an update is due: the last published update is older than
+  `auto_update_min` (1440 = once a day) minutes - whichever server notices first does it - or edits have been
+  waiting for more than 2 minutes;
+* makes all missing previews in a separate process after each of its own builds (see *Preview
+  images*);
+* shows the newest page: the catalog folder's when another machine published after its last
+  build, else the local copy;
+* goes read-only if an old version of the server (before the inbox, with `server.lock`) still
+  runs on another machine - update that one first;
+* logs to `.work\logs\server.log`. Every processed edit is recorded in `logs\web_edits.log` in the
+  catalog folder (who, what, outcome).
+
+Builds started by hand (`build_catalog.py`) take `build.lock` too and exit with code 5 while
+another machine builds.
 
 ### Editing in the browser
 
@@ -50,6 +70,19 @@ Click a dataset row:
   set or corrected ("Set / correct a value"), and manual values can be removed again. Values
   are checked immediately (e.g. NA must be a number). Stored in `manual_overrides.csv`.
 * **Unassigned files** (bottom of the page): link a file to a dataset with a dropdown.
+
+Edits are queued in the inbox and applied by the next build, one after the other in the order
+they were made (`mdcat/inbox.py`):
+* Until then they are shown as *pending* (the header counts them), on every server.
+* **Values are compare-and-set:** an edit carries the value its author saw. If someone else
+  changed that value in the meantime, the edit is not applied but listed under **Edits not
+  applied** in the dataset (for 14 days) with the current value and who set it - check it and
+  enter yours again if needed. Comments never conflict.
+* Invalid edits (e.g. the dataset no longer exists) are listed there as *failed*.
+* Processed edits move to `inbox\done`, `inbox\conflicts` or `inbox\failed` (deleted after 30
+  days; the history stays in `catalog.sqlite`, `manual_overrides.csv` and `logs\web_edits.log`).
+  They leave the inbox only after the catalog was published; table `applied_edits` records every
+  processed edit, so a build that crashed halfway never applies an edit twice.
 
 ## Preview images
 
@@ -63,14 +96,24 @@ First timepoint; tile scans use the merged mosaic or the middle tile; the subtit
 series (Fiji number) and the cutout position. Pixels are read read-only with Bio-Formats
 (pyramid levels where available, strip-wise otherwise). Previews are cached per file
 (size + modification time); a moved/renamed file gets a new preview. They are made by
-`make_previews.py`, a separate process with its own lock, so catalog builds (and edits) are never
-blocked by it: the server runs it 90 s after start and then every `auto_update_min`, spending at
-most `preview_budget_min` (20) minutes per run (newest datasets first); afterwards a quick build
-links and publishes the new previews. Roughly 10-30 s per file (deep z-stacks and large mosaics
-take longest). How much is read per image is set by `previews` (setup page):
-`network` (default) reads at most ~300 MB of pixel data per image - suited for VPN; `full` up to
-~3 GB (more Z planes for huge stacks); `off` makes none. By hand: `.venv\Scripts\python.exe make_previews.py [--budget MIN]`, or
-`build_catalog.py --preview-budget MIN` (inline). Shown in the image table of a dataset (click to enlarge).
+`make_previews.py`, a separate process that never holds `build.lock`, so catalog builds (and
+edits) are never blocked by it. The server runs it after each of its own successful builds (and
+on **Update now** in the tray); a run makes all missing previews (newest datasets first) and
+stops when done, or after `preview_budget_min` (default 1380 = 23 h) - the rest then follows in
+the next run. With several machines:
+* `preview.lock` in the catalog folder lets one machine render at a time; the others skip;
+* every new preview is copied into the catalog folder at once, and previews already there are
+  copied instead of rendered - nothing is rendered twice;
+* every build first takes the previews from the catalog folder that it does not have yet, so any
+  machine's build links them into the page; during a long run the server also starts a build
+  every hour to show the new ones, and once more at the end.
+
+Roughly 10-30 s per file (deep z-stacks and large mosaics take longest). How much is read per
+image is set by `previews` (setup page): `network` (default) reads at most ~300 MB of pixel data
+per image - suited for VPN; `full` up to ~3 GB (more Z planes for huge stacks); `off` makes none.
+By hand: `.venv\Scripts\python.exe make_previews.py [--budget MIN]`, or
+`build_catalog.py --preview-budget MIN` (inline - holds `build.lock` meanwhile, so keep it short).
+Shown in the image table of a dataset (click to enlarge).
 
 ## Running a build by hand
 
@@ -85,7 +128,7 @@ cd <program folder>
 | `--retry-errors` | re-read files that failed before although they did not change |
 | `--force` | re-read every file (normally only new/changed files are read) |
 | `--verify-readonly` | list the data folder again at the end and report any difference |
-| `--no-previews` / `--preview-budget MIN` | no new previews / time for new previews in this run |
+| `--preview-budget MIN` | also make new previews inside this run (default: none - `make_previews.py` does that; `--no-previews` is accepted for compatibility) |
 | `--no-publish` | do not copy the result into the catalog folder |
 | `--only TEXT --out DIR` | test on paths containing TEXT, in a separate working folder (never pulls or publishes) |
 
@@ -106,7 +149,7 @@ In the catalog folder (and the working copy `.work\`):
 |---|---|
 | `catalog.html` (published as `index.html`) | interactive overview: search, filters, sort; click a row for comments, values, images (with previews), scenes and files |
 | `CATALOG.md` | static overview grouped by instrument and session, ☑/☐ for what exists |
-| `catalog.sqlite` | full database (`acquisitions`, `images`, `scenes`, `locations`, `attachments`, `needs_input`, `runs`, `sources`, `comments`) |
+| `catalog.sqlite` | full database (`acquisitions`, `images`, `scenes`, `locations`, `attachments`, `needs_input`, `runs`, `sources`, `comments`, `applied_edits`) |
 | `catalog_datasets.csv` / `catalog_images.csv` / `catalog_files.csv` / `catalog_scenes.csv` | flat tables (Excel-compatible, UTF-8) |
 | `catalog.json` | nested export (dataset -> images, files, scenes, comments) |
 | `comments.csv` | full comment log (export of the `comments` table) |
@@ -115,7 +158,8 @@ In the catalog folder (and the working copy `.work\`):
 | `manual_overrides.csv` | manual values (browser, `needs_input.csv` or edited by hand) |
 | `CHANGELOG.md` | new / changed / removed datasets per run |
 | `metadata/` (`.work\cache\xml`, `orig`) | cached raw metadata (OME-XML), so changes of the parsing logic never need the data again |
-| `sync.json`, `server.lock` | generation of the catalog folder; which server maintains it |
+| `inbox\` (catalog folder only) | edits waiting for the next build; processed ones in `done\`, `conflicts\`, `failed\` |
+| `sync.json`, `build.lock` | generation of the catalog folder (and who published it); which machine is building right now |
 | `.work\logs\` | build, preview and server logs (only `web_edits.log` is copied to the catalog folder) |
 
 `scenes.py` (command line) looks up exact series numbers, see below.
@@ -195,7 +239,7 @@ Or use `--interactive`. `manual_overrides.csv` rows: `acq_id, image_key, field, 
 * Single exception: the catalog folder. Inside the Labdata root it must be a folder directly in
   it; it is created by the tool (marker file `.mdcat-publish`; an existing non-empty folder
   without it is refused), only whitelisted file names are written (atomically, `.tmp` +
-  rename), only previews and `server.lock` are ever deleted, and the scan skips every top-level
+  rename), only previews, the lock files and inbox entries are ever deleted, and the scan skips every top-level
   folder carrying the marker. Nothing is written there with `--no-publish`, `--only` or `--out`.
 * Pixel data for previews is only read (Bio-Formats `openBytes`).
 * Metadata is read with Bio-Formats (`java/OmeDump.java`, `bioformats_package.jar`) without

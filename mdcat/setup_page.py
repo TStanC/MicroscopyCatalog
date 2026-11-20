@@ -51,7 +51,7 @@ If it already contains a catalog, that one is used. Inside the Labdata folder it
 <label for="previews">Preview images</label>
 <select id="previews"><option value="network">network-friendly (read ≤ 300 MB per image)</option>
 <option value="full">full (read ≤ 3 GB per image – for fast connections)</option><option value="off">off</option></select>
-<span class="hint">at most</span> <input type="number" id="preview_budget_min" min="1" step="5"> <span class="hint">minutes per update</span>
+<span class="hint">at most</span> <input type="number" id="preview_budget_min" min="1" step="5"> <span class="hint">minutes per run (1380 = 23 h; stops earlier when all previews are made)</span>
 <label class="cb"><input type="checkbox" id="autostart"> Start the catalog server automatically when I log in</label>
 </div>
 

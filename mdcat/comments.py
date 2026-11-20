@@ -50,26 +50,38 @@ def _insert(db: sqlite3.Connection, row: dict) -> None:
     db.commit()
 
 
-def add_comment(db: sqlite3.Connection, acq_id: str, text: str, user: str, image_key: str = "") -> dict:
+def check_text(text: str) -> str:
     text = (text or "").strip()
     if not text:
         raise ValueError("empty comment")
     if len(text) > MAX_LEN:
         raise ValueError(f"comment longer than {MAX_LEN} characters")
-    ts = datetime.now().isoformat(timespec="seconds")
-    cid = hashlib.sha1(f"{ts}|{user}|{acq_id}|{text}".encode("utf-8")).hexdigest()[:10]
+    return text
+
+
+def exists(db: sqlite3.Connection, comment_id: str, action: str = "add") -> bool:
+    return db.execute("SELECT 1 FROM comments WHERE comment_id=? AND action=?",
+                      (comment_id, action)).fetchone() is not None
+
+
+def add_comment(db: sqlite3.Connection, acq_id: str, text: str, user: str, image_key: str = "",
+                ts: str | None = None, comment_id: str | None = None) -> dict:
+    """``ts`` / ``comment_id`` are given when the comment comes from the edit inbox."""
+    text = check_text(text)
+    ts = ts or datetime.now().isoformat(timespec="seconds")
+    cid = comment_id or hashlib.sha1(f"{ts}|{user}|{acq_id}|{text}".encode("utf-8")).hexdigest()[:10]
     row = {"ts": ts, "user": user, "action": "add", "comment_id": cid, "acq_id": acq_id,
            "image_key": image_key or "", "text": text}
     _insert(db, row)
     return row
 
 
-def delete_comment(db: sqlite3.Connection, comment_id: str, user: str) -> dict:
+def delete_comment(db: sqlite3.Connection, comment_id: str, user: str, ts: str | None = None) -> dict:
     match = [c for c in active_comments(db) if c["comment_id"] == comment_id]
     if not match:
         raise ValueError("comment not found (already deleted?)")
     c = match[0]
-    row = {"ts": datetime.now().isoformat(timespec="seconds"), "user": user, "action": "delete",
+    row = {"ts": ts or datetime.now().isoformat(timespec="seconds"), "user": user, "action": "delete",
            "comment_id": comment_id, "acq_id": c["acq_id"], "image_key": c["image_key"], "text": ""}
     _insert(db, row)
     return row
