@@ -327,7 +327,12 @@ if (-not $NoStart) {
         try { $s = Invoke-RestMethod -UseBasicParsing "http://127.0.0.1:$usePort/api/state" -TimeoutSec 5; if ($s.status) { $ok = $true } } catch { }  # localhost may try IPv6 first (slow)
     }
     if ($ok) { Say "Server running: $url  (status: $($s.status))" }
-    else { Say "The server did not answer yet - see $root\.work\logs\server.log" }
+    else {
+        Say "The server did not answer yet - see $root\.work\logs\server.log"
+        $crash = Join-Path $root ".work\logs\server_crash.log"
+        if (Test-Path $crash) { Say "  and $crash :"; Get-Content $crash -Tail 15 | ForEach-Object { Say "    $_" } }
+        Say "  To see errors directly: `"$venvPy`" `"$serve`" --console --no-tray"
+    }
 }
 Say ""
 Say "Done."

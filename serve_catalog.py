@@ -50,10 +50,37 @@ if os.path.isdir(_VENV_SP) and os.path.normcase(sys.prefix) != os.path.normcase(
     import site  # started with the base interpreter's pythonw.exe (see pythonw()): use the venv's packages
     site.addsitedir(_VENV_SP)
 
-from mdcat import comments as cm  # noqa: E402
-from mdcat import config as mcfg  # noqa: E402
-from mdcat import inbox, lease, safety, setup_page, sync, winuser  # noqa: E402
-from mdcat import overrides as ov  # noqa: E402
+CRASH_LOG = os.path.join(HERE, ".work", "logs", "server_crash.log")  # = mdcat.config.DEFAULT_WORK_DIR/logs
+
+
+def write_crash_log() -> None:
+    """Under pythonw nobody sees a traceback: append the current exception to server_crash.log."""
+    import traceback
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG), exist_ok=True)
+        with open(CRASH_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"--- {datetime.now().isoformat(timespec='seconds')}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
+
+
+try:
+    from mdcat import comments as cm  # noqa: E402
+    from mdcat import config as mcfg  # noqa: E402
+    from mdcat import inbox, lease, safety, setup_page, sync, winuser  # noqa: E402
+    from mdcat import overrides as ov  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 - e.g. a module missing after an incomplete update
+    if __name__ == "__main__":
+        write_crash_log()
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None, f"The microscopy catalog server cannot start:\n\n{_exc!r}\n\nDetails: {CRASH_LOG}\n\n"
+                      f"Update the program folder (git pull) and run install.ps1 again.",
+                "Microscopy catalog", 0x10)
+        except Exception:  # noqa: BLE001
+            pass
+    raise
 
 INJECT_BEFORE = b'<script type="application/json" id="data">'
 CREATE_NO_WINDOW = 0x08000000
@@ -882,9 +909,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception:  # noqa: BLE001 - under pythonw nobody sees a traceback: write it to a file
-        import traceback
-        d = os.path.join(mcfg.DEFAULT_WORK_DIR, "logs")
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "server_crash.log"), "a", encoding="utf-8") as fh:
-            fh.write(f"--- {datetime.now().isoformat(timespec='seconds')}\n{traceback.format_exc()}\n")
+        write_crash_log()
         raise
