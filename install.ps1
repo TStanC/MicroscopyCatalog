@@ -17,6 +17,7 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -DownloadJdk    ignore installed JDKs, download one
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -WithMicroio <path or git URL>   optional zarr reader
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Port 8780    use another port than 8766
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Mcp            also install the MCP server (mcp_server.py) for AI agents
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Stop           stop the server
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall      stop + remove the shortcuts
 
@@ -28,7 +29,8 @@ param(
     [string]$JavaHome = "",
     [switch]$DownloadJdk,
     [string]$WithMicroio = "",
-    [int]$Port = 0
+    [int]$Port = 0,
+    [switch]$Mcp
 )
 
 $ErrorActionPreference = "Stop"
@@ -144,7 +146,7 @@ Say "  $(& $uv --version)"
 Step "Python environment (.venv)"
 Push-Location $root
 try {
-    & $uv sync --locked --inexact
+    if ($Mcp) { & $uv sync --locked --inexact --group mcp } else { & $uv sync --locked --inexact }
     if ($LASTEXITCODE -ne 0) { throw "uv sync failed" }
     if ($WithMicroio) {
         Say "  installing microio from $WithMicroio"
@@ -333,6 +335,11 @@ if (-not $NoStart) {
         if (Test-Path $crash) { Say "  and $crash :"; Get-Content $crash -Tail 15 | ForEach-Object { Say "    $_" } }
         Say "  To see errors directly: `"$venvPy`" `"$serve`" --console --no-tray"
     }
+}
+if ($Mcp) {
+    Step "MCP server for AI agents (mcp_server.py)"
+    Say "  Register it once per Windows user, e.g. for Claude Code:"
+    Say "    claude mcp add microscopy-catalog --scope user -- `"$venvPy`" `"$(Join-Path $root 'mcp_server.py')`""
 }
 Say ""
 Say "Done."

@@ -22,12 +22,16 @@
   separate process (make_previews.py).
 * Shows an icon in the notification area (bottom right): left click opens the catalog; right click:
   Open catalog, Update now, Settings, Stop. Colour = status (green ok, orange offline/read-only).
+* Read-only JSON API (/api/overview, /api/search, /api/dataset, /api/comments, /api/sql) for
+  mcp_server.py; its requests (header X-MDCAT-Agent: mcp) act as "<user>_mcp" and may only
+  add comments and delete their own.
 * Never writes below the Labdata root except into the catalog folder.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -42,6 +46,7 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -69,6 +74,7 @@ try:
     from mdcat import config as mcfg  # noqa: E402
     from mdcat import inbox, lease, safety, setup_page, sync, winuser  # noqa: E402
     from mdcat import overrides as ov  # noqa: E402
+    from mdcat import query as qy  # noqa: E402
 except Exception as _exc:  # noqa: BLE001 - e.g. a module missing after an incomplete update
     if __name__ == "__main__":
         write_crash_log()
@@ -90,6 +96,9 @@ STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\St
 EXIT_MSG = {2: "not set up", 4: "Labdata folder not reachable", 5: "a build is running on another machine"}
 BUSY_RETRY_S = 60          # build.lock taken by another machine and edits waiting: try again
 CHECK_EVERY_S = 300        # how often the server checks whether an update is due
+READ_API = ("/api/overview", "/api/search", "/api/dataset", "/api/comments", "/api/sql")
+MCP_SUFFIX = "_mcp"        # requests of mcp_server.py (header X-MDCAT-Agent: mcp) act as "<user>_mcp"
+MCP_PATHS = ("/api/comment", "/api/comment/delete", "/api/sql")
 
 
 class Server(ThreadingHTTPServer):
@@ -507,6 +516,34 @@ class App:
                 continue
         return False
 
+    # --- read API (mcp_server.py): the newest catalog database, opened read-only per request ---
+    @contextlib.contextmanager
+    def catalog_db(self):
+        """Read-only connection to the newest catalog.sqlite - the catalog folder's when another
+        machine published after this server's last build, else the local copy (as ``_page``).
+        Closed right after the request, so a build can always replace the file."""
+        local = (self.cfg.db_path, False)
+        share = (os.path.join(self.cfg.publish_dir, "catalog.sqlite"), True) if self.cfg.publish_dir else None
+        cands = [share, local] if share and self.share_generation() > self.local_generation() else [local, share]
+        for c in cands:
+            if c and os.path.exists(c[0]):
+                db = qy.connect(*c)
+                try:
+                    yield db
+                finally:
+                    db.close()
+                return
+        raise ValueError("no catalog database yet - the first build has not finished")
+
+    def comment_owner(self, comment_id: str) -> dict | None:
+        """``{"user", "acq_id"}`` of an active comment (applied or still in the inbox)."""
+        pending = self.pending_edits()
+        try:
+            with self.catalog_db() as db:
+                return qy.comment_author(db, comment_id, pending)
+        except (ValueError, sqlite3.Error):
+            return qy.comment_author(None, comment_id, pending)
+
     # --- edit actions: validated here, written to the inbox, applied by the next build ---
     def _submit(self, user: str, action: str, **fields) -> dict:
         e = inbox.new_entry(action, user, **fields)
@@ -767,6 +804,38 @@ def make_handler(app: App, port: int):
                                             "failed": [inbox.public(e) for e in inbox.recent(pdir, "failed")]})
                 except OSError as exc:
                     return self._json(200, {"pending": [], "conflicts": [], "failed": [], "error": str(exc)})
+            if path in READ_API:
+                return self._read_api(path, {k: v[-1] for k, v in parse_qs(urlsplit(self.path).query).items()})
+            return self._send(404, b"not found", "text/plain")
+
+        def _read_api(self, path: str, p: dict):
+            """Read-only JSON API on the catalog database (used by mcp_server.py)."""
+            if app.status == "setup":
+                return self._json(503, {"ok": False, "error": "the catalog server is not set up yet"})
+            try:
+                with app.catalog_db() as db:
+                    if path == "/api/overview":
+                        return self._json(200, {"ok": True, **qy.overview(db), "server_status": app.status,
+                                                "server_status_msg": app.status_msg,
+                                                "pending_edits": len(app.pending_edits())})
+                    if path == "/api/search":
+                        return self._json(200, {"ok": True, **qy.search_datasets(db, p)})
+                    if path == "/api/dataset":
+                        acq = str(p.get("acq_id", ""))
+                        d = qy.get_dataset(db, acq, int(p.get("max_scenes", 50)))
+                        if d is None:
+                            return self._json(404, {"ok": False, "error": f"unknown dataset {acq!r}"})
+                        d["pending_comments"] = qy.filter_pending_comments(app.pending_edits(), {"acq_id": acq})
+                        return self._json(200, {"ok": True, **d})
+                    if path == "/api/comments":
+                        return self._json(200, {"ok": True, **qy.search_comments(db, p),
+                                                "pending": qy.filter_pending_comments(app.pending_edits(), p)})
+                    if path == "/api/sql":
+                        return self._json(200, {"ok": True, **qy.run_sql(db, p.get("sql", ""), p.get("limit", 200))})
+            except (ValueError, TypeError) as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            except sqlite3.Error as exc:
+                return self._json(500, {"ok": False, "error": f"database error: {exc}"})
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
@@ -777,6 +846,13 @@ def make_handler(app: App, port: int):
                     or not self.headers.get("Content-Type", "").startswith("application/json")):
                 return self._json(403, {"ok": False, "error": "forbidden"})
             user = self._user()
+            agent = self.headers.get("X-MDCAT-Agent", "")
+            if agent:
+                # the local MCP server (mcp_server.py): it acts as "<Windows user>_mcp", may only read,
+                # add comments and delete its own comments
+                if agent != "mcp" or path not in MCP_PATHS:
+                    return self._json(403, {"ok": False, "error": f"not allowed for the agent {agent!r}"})
+                user = f"{user}{MCP_SUFFIX}" if user else None
             owner_only = path in ("/api/check", "/api/pickfolder", "/api/setup", "/api/rebuild")
             if owner_only and not app.is_owner(user):
                 return self._json(403, {"ok": False, "error": f"only {app.me} (who runs this server) may change "
@@ -788,6 +864,8 @@ def make_handler(app: App, port: int):
                     raise ValueError
             except (ValueError, json.JSONDecodeError):
                 return self._json(400, {"ok": False, "error": "invalid JSON"})
+            if path == "/api/sql":  # read-only; POST because the SQL text can be long
+                return self._read_api(path, body)
             try:
                 if path == "/api/check":
                     return self._json(200, {"ok": True, **app.check_folders(body)})
@@ -807,6 +885,16 @@ def make_handler(app: App, port: int):
                     app.log(f"{user}: rebuild requested")
                     return self._json(200, {"ok": True, "result": "rebuild requested",
                                             "generation": app.builder.request(f"requested by {user}")})
+                if agent and path == "/api/comment/delete":
+                    cid = str(body.get("comment_id", ""))
+                    owner = app.comment_owner(cid)
+                    if owner is None:
+                        raise ValueError(f"comment {cid!r} not found (or already deleted)")
+                    if owner["user"].lower() != user.lower():
+                        return self._json(403, {"ok": False, "error": f"comment {cid} was written by "
+                                                                      f"{owner['user']}; {user} may only delete "
+                                                                      f"its own comments"})
+                    body = {**body, "acq_id": owner["acq_id"]}
                 entry = actions[path](user, body)
             except (ValueError, TimeoutError, subprocess.TimeoutExpired, OSError) as exc:
                 return self._json(400, {"ok": False, "error": str(exc)})

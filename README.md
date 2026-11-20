@@ -14,6 +14,7 @@ Installation: see [INSTALL.md](INSTALL.md).
 | Catalog for everybody (read-only) | `<catalog folder>\index.html` |
 | Catalog with editing | `http://localhost:8766` on any machine running the server |
 | Local working copy + logs | `.work\` in the program folder |
+| Catalog for AI agents (MCP, search + comments) | `mcp_server.py`, see *AI agents* |
 
 Any number of servers (machines, users) can use the same catalog folder at the same time:
 
@@ -83,6 +84,39 @@ they were made (`mdcat/inbox.py`):
   days; the history stays in `catalog.sqlite`, `manual_overrides.csv` and `logs\web_edits.log`).
   They leave the inbox only after the catalog was published; table `applied_edits` records every
   processed edit, so a build that crashed halfway never applies an edit twice.
+
+## AI agents (MCP server)
+
+`mcp_server.py` is an [MCP](https://modelcontextprotocol.io) server that lets an AI agent
+(e.g. Claude Code) search the catalog and write comments. The MCP client starts it over stdio
+as the logged-in Windows user, so it opens no port of its own. It is a thin client of the
+catalog server on `http://localhost:<server_port>` and touches no files: the catalog server must be
+running.
+
+| Tool | What it does |
+|---|---|
+| `catalog_overview` | counts, values per instrument/status/owner/kind/format, presence flags, last build, table columns |
+| `search_datasets` | filters: free text (also searches comments), instrument, session, owner, status, kind, format, date range, `has_*` flags, minimum T/Z/C, magnification, objective; sorting and paging |
+| `get_dataset` | one dataset with its images, files, scenes, missing values and comments (including pending ones) |
+| `search_comments` | comments by text, author or dataset |
+| `sql_query` | one read-only `SELECT` on `catalog.sqlite` (at most 500 rows, stopped after 10 s) |
+| `add_comment` | comment on a dataset or image as **`<Windows user>_mcp`** (e.g. `go24meg_mcp`) |
+| `delete_own_comment` | delete a comment of that same `_mcp` user, whether applied or pending |
+
+The catalog server serves the read-only JSON API for these tools (`GET /api/overview`, `/api/search`,
+`/api/dataset`, `/api/comments`, `POST /api/sql`; `mdcat/query.py`). It opens the newest
+`catalog.sqlite` read-only for each request and closes it again, so nothing is copied and
+builds are never blocked. Requests from the MCP carry the header `X-MDCAT-Agent: mcp`. For these
+requests the server takes the Windows user from the connection as usual and adds `_mcp`, so an
+agent cannot act under anyone else's name. It allows only reads, new comments and deleting the
+agent's own comments. Manual values, settings and rebuilds are refused. Comments from agents go
+through the inbox like any other edit (pending until the next build).
+
+Setup (once per Windows user): `install.ps1 -Mcp` installs the `mcp` dependency group, then
+```powershell
+claude mcp add microscopy-catalog --scope user -- "<program folder>\.venv\Scripts\python.exe" "<program folder>\mcp_server.py"
+```
+`--port N` overrides `server_port`. Tests: `.venv\Scripts\python.exe -m unittest discover -s tests -v`.
 
 ## Preview images
 

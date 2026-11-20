@@ -85,6 +85,21 @@ You can change the settings later with **⚙ Settings** in the header of the cat
 Anyone can open the catalog page read-only, without a server, at
 `<catalog folder>\index.html`.
 
+## Optional: AI agents (MCP)
+
+To let an AI agent such as Claude Code search the catalog and add comments:
+
+```powershell
+cd "$env:LOCALAPPDATA\Programs\microscopy-catalog"
+powershell -ExecutionPolicy Bypass -File install.ps1 -Mcp
+claude mcp add microscopy-catalog --scope user -- "$PWD\.venv\Scripts\python.exe" "$PWD\mcp_server.py"
+```
+
+Every Windows user who wants the agent registers it once (the `claude mcp add` line). The
+agent's comments appear under your user name plus `_mcp` (e.g. `go24meg_mcp`). The agent can only
+read the catalog, add comments and delete its own comments. The catalog server must be running.
+See README.md, *AI agents*.
+
 ## Updating
 
 ```powershell
@@ -137,4 +152,5 @@ comments and values.
 | Another program already uses port 8766 | The installer then picks the next free port (it tells you which one, e.g. `http://localhost:8767`) and saves it in `settings.toml`. To choose one yourself: `install.ps1 -Port 8780`. |
 | The server does not start | See `.work\logs\server.log` and `.work\logs\server_crash.log`. To watch it live in a console: stop it, then run `.venv\Scripts\python.exe serve_catalog.py --console` in the program folder (Ctrl+C stops it). |
 | You moved or renamed the program folder | Run `install.ps1` again (the Python environment contains absolute paths). |
+| The AI agent says "the microscopy catalog server is not reachable" | Start the server (Start menu → **Microscopy Catalog**). If it uses another port than the one in `settings.toml`, register the MCP with `mcp_server.py --port N`. |
 | Optional: better zarr inspection with microio | `install.ps1 -WithMicroio <path or git URL of microio>` |
