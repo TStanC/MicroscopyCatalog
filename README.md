@@ -230,7 +230,7 @@ Presence flags: `has_original`, `has_zarr` (+ `n_zarr`), `has_segmentation` (zar
 
 | Value | Order of sources |
 |---|---|
-| acquisition start | OME `AcquisitionDate` -> date in file/folder name (`filename`) -> file time (snapshots only) -> manual |
+| acquisition start | OME `AcquisitionDate` -> date in file/folder name (`filename`) -> file time (snapshots only) -> manual. Olympus `.vsi`: `AcquisitionDate` is cellSens' "Creation time (UTC)" = when the document is saved = the **end** of the acquisition, so start = date - plane-timestamp span (unless the file was last written at date + span, i.e. created at the start and streamed to disk). The stored date itself (fingerprint, `acq_id`) is unchanged. |
 | total time | first timestamp to last plane timestamp (`AcquisitionDate` + max `DeltaT`) |
 | Δt | median step of per-timepoint `Plane.DeltaT` -> `Pixels.TimeIncrement` -> microio repair in zarr -> manual |
 | z step | `PhysicalSizeZ` -> median stage `PositionZ` step -> microio repair in zarr -> manual |

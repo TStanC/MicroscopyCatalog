@@ -18,7 +18,7 @@ import json
 import re
 import statistics
 from collections import Counter, OrderedDict, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .config import Config
 from .omexml import series_fingerprint, to_um
@@ -81,6 +81,41 @@ def _iso(ts: float | None) -> str | None:
 
 def _hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
+def _epoch_utc(d: str | None) -> float | None:
+    """Epoch of a naive OME date read as UTC (Bio-Formats/cellSens write UTC), for comparing with file mtimes."""
+    if not d:
+        return None
+    try:
+        return datetime.fromisoformat(d).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def series_times(s: dict, fmt: str, src_mtime: float | None = None) -> tuple[float | None, float | None]:
+    """(start, end) epochs of one series.
+
+    For most formats the OME AcquisitionDate is the start and the plane DeltaTs span the run.
+    Olympus cellSens (.vsi) only stores "Creation time (UTC)" - the moment the document is
+    saved, i.e. the END of the acquisition - which Bio-Formats passes on as AcquisitionDate.
+    So for .vsi: start = date - span, end = date. Exception: a file whose last write lies at
+    date + span (document created at the start and streamed to disk, e.g.
+    20260607_LMNB1_chir_60x_d0_001) keeps the date as its start. File mtimes are only trusted
+    for that positive match, because copies of a folder can carry unrelated later mtimes.
+    """
+    t0 = _epoch(s.get("date"))
+    if t0 is None:
+        return None, None
+    span = s.get("span_s") or 0.0
+    if fmt != "vsi" or span <= 0:
+        return t0, t0 + span
+    if src_mtime:
+        created = _epoch_utc(s.get("date"))
+        tol = max(300.0, 0.01 * span)
+        if span > 2 * tol and abs(src_mtime - (created + span)) <= tol:
+            return t0, t0 + span
+    return t0 - span, t0
 
 
 def date_from_text(text: str) -> str | None:
@@ -196,8 +231,8 @@ def role_ranges(roles, offset: int = 0) -> str:
 
 # ----------------------------------------------------------------------------- images
 
-def build_images(summary: dict, fmt: str) -> list[dict]:
-    """Group the series of one file into logical images."""
+def build_images(summary: dict, fmt: str, src_mtime: float | None = None) -> list[dict]:
+    """Group the series of one file into logical images (src_mtime: last write of the file, see series_times)."""
     series = summary.get("series", [])
     orig = summary.get("orig_objectives", {})
     groups: "OrderedDict[str, dict]" = OrderedDict()
@@ -236,9 +271,9 @@ def build_images(summary: dict, fmt: str) -> list[dict]:
             rep = next(s for s in pool if (s["T"], s["C"], s["Z"], s["Y"], s["X"]) == top)
             tiles = [s for s in pool if (s["Y"], s["X"]) == (rep["Y"], rep["X"])]
 
-        starts = [_epoch(s["date"]) for s in pool if s.get("date")]
-        starts = [x for x in starts if x is not None]
-        ends = [_epoch(s["date"]) + (s.get("span_s") or 0.0) for s in pool if _epoch(s.get("date")) is not None]
+        times = {id(s): series_times(s, fmt, src_mtime) for s in pool}
+        starts = [times[id(s)][0] for s in pool if times[id(s)][0] is not None]
+        ends = [times[id(s)][1] for s in pool if times[id(s)][1] is not None]
         start = min(starts) if starts else None
         end = max(ends) if ends else None
 
@@ -342,7 +377,8 @@ def build_images(summary: dict, fmt: str) -> list[dict]:
             "fiji_series_detail": role_ranges(roles, 1),
             "_scenes": [{"series": s["idx"], "name": s["name"], "T": s["T"], "C": s["C"], "Z": s["Z"], "Y": s["Y"],
                          "X": s["X"], "dtype": s.get("dtype"), "px_x_um": s.get("px_x"), "px_y_um": s.get("px_y"),
-                         "px_z_um": s.get("px_z"), "role": role, "acquired_start": s.get("date"),
+                         "px_z_um": s.get("px_z"), "role": role,
+                         "acquired_start": s.get("date") if fmt != "vsi" else _iso(series_times(s, fmt, src_mtime)[0]),
                          "duration_s": s.get("span_s"), "time_delta_s": s.get("dt_med")} for s, role in roles],
             "_fps": sorted({fp for fp in (series_fingerprint(s) for s in allser + previews) if fp}),
             "_series_idx": [s["idx"] for s in allser],
@@ -610,13 +646,13 @@ def _compose(cfg: Config, a: dict, files: dict, ovs: list[dict]):
     fmt = canon["fmt"]
 
     # Which summary describes the images? Original if readable, else the first readable zarr.
-    summary, summary_fmt, meta_from = None, fmt, None
+    summary, summary_fmt, meta_from, meta_mtime = None, fmt, None, None
     if canon["status"] == "ok" and canon.get("summary_obj"):
-        summary, meta_from = canon["summary_obj"], canon["rel"]
+        summary, meta_from, meta_mtime = canon["summary_obj"], canon["rel"], canon.get("max_mtime")
     else:
         for o in a["originals"][1:]:
             if o["status"] == "ok" and o.get("summary_obj"):
-                summary, summary_fmt, meta_from = o["summary_obj"], o["fmt"], o["rel"]
+                summary, summary_fmt, meta_from, meta_mtime = o["summary_obj"], o["fmt"], o["rel"], o.get("max_mtime")
                 notes.append("metadata read from a duplicate copy")
                 break
         if summary is None:
@@ -626,7 +662,7 @@ def _compose(cfg: Config, a: dict, files: dict, ovs: list[dict]):
                     if cat != "zarr_only":
                         notes.append("original unreadable - metadata taken from zarr")
                     break
-    images = build_images(summary, summary_fmt) if summary else []
+    images = build_images(summary, summary_fmt, meta_mtime) if summary else []
     if any(im.get("_embedded_preview") for im in images):
         # The original only holds a preview; a zarr converted earlier may still hold the real series.
         for z in a["zarrs"]:
